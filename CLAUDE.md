@@ -9,7 +9,7 @@ AR party game: push friends' balls off an arena anchored on a business-card mark
 ## Working mode
 - Main session = **project manager/orchestrator only**. Delegate all exploring, research, coding, testing and running to subagents with fresh context (Sonnet for real coding/debugging/research, Haiku for mechanical/simple tasks). Give each a self-contained brief: goal, files, constraints, acceptance check, and "report back concisely".
 - The user is the client. Show working features when meaningful; ask them to test what agents can't (real phones: Android main, old iPhone 6s/iOS 15).
-- Commit after each completed task (small commits, conventional messages).
+- Commit after each completed task (small commits, conventional messages). Pushing to `main` (which deploys Pages) is allowed.
 
 ## Conventions
 - Strict TypeScript, npm workspaces (`packages/tracker` is standalone: no game or three.js imports).

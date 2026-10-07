@@ -1,0 +1,32 @@
+{
+  "name": "arena",
+  "private": true,
+  "version": "0.0.1",
+  "type": "module",
+  "workspaces": ["packages/*"],
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview",
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit",
+    "lint": "eslint .",
+    "gen:marker": "tsx scripts/gen-marker.ts"
+  },
+  "devDependencies": {
+    "@eslint/js": "^10.0.1",
+    "@vitejs/plugin-basic-ssl": "^2.3.0",
+    "eslint": "^10.12.0",
+    "prettier": "^3.9.9",
+    "tsx": "^4.23.15",
+    "typescript": "~6.0.3",
+    "typescript-eslint": "^8.71.1",
+    "vite": "^8.3.3",
+    "vitest": "^5.0.3"
+  },
+  "dependencies": {
+    "@arena/tracker": "*",
+    "@types/three": "^0.186.0",
+    "three": "^0.186.1"
+  }
+}

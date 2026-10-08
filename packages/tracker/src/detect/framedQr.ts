@@ -174,25 +174,115 @@ interface Scored {
   margin: number
 }
 
-/** Best of the 4 cyclic rotations: 3 finder positions finder-like, the 4th not. */
+const QR_ORIGIN = FRAME_THICKNESS + QUIET_ZONE
+const GRID_SIGMAS = [0, 0.7, 1.4]
+const gridTemplates = new WeakMap<MarkerGrid, { t: Float64Array; norm: number }[]>()
+
+/** Zero-mean ideal QR (+-1, dark = -1) blurred by several gaussians (in modules), one template per sigma. */
+function templatesFor(grid: MarkerGrid): { t: Float64Array; norm: number }[] {
+  const cached = gridTemplates.get(grid)
+  if (cached) return cached
+  const n = grid.size
+  const dark = (i: number, j: number): number =>
+    i < 0 || j < 0 || i >= n || j >= n ? 1 : grid.modules[j]?.[i] ? -1 : 1
+  const out = GRID_SIGMAS.map((sigma) => {
+    const t = new Float64Array(n * n)
+    const R = Math.ceil(sigma * 2.5)
+    for (let j = 0; j < n; j++) {
+      for (let i = 0; i < n; i++) {
+        if (sigma === 0) {
+          t[j * n + i] = dark(i, j)
+          continue
+        }
+        let acc = 0
+        let ws = 0
+        for (let oy = -R; oy <= R; oy++) {
+          for (let ox = -R; ox <= R; ox++) {
+            const w = Math.exp(-(ox * ox + oy * oy) / (2 * sigma * sigma))
+            acc += w * dark(i + ox, j + oy)
+            ws += w
+          }
+        }
+        t[j * n + i] = acc / ws
+      }
+    }
+    let m = 0
+    for (const v of t) m += v
+    m /= t.length
+    let nn = 0
+    for (let k = 0; k < t.length; k++) {
+      t[k] = (t[k] ?? 0) - m
+      nn += (t[k] ?? 0) ** 2
+    }
+    return { t, norm: Math.sqrt(nn) }
+  })
+  gridTemplates.set(grid, out)
+  return out
+}
+
+/** NCC of the whole sampled QR (every module centre, through H) with the expected grid. */
+function qrCorrelation(img: GrayImage, H: Mat3, grid: MarkerGrid): number {
+  const n = grid.size
+  const vals = new Float64Array(n * n)
+  const mod = QR_SIZE / n
+  let mean = 0
+  for (let j = 0; j < n; j++) {
+    for (let i = 0; i < n; i++) {
+      const [x, y] = applyHomography(H, QR_ORIGIN + (i + 0.5) * mod, QR_ORIGIN + (j + 0.5) * mod)
+      const v = sampleGray(img, x, y)
+      vals[j * n + i] = v
+      mean += v
+    }
+  }
+  mean /= vals.length
+  let sxx = 0
+  for (let k = 0; k < vals.length; k++) {
+    const a = (vals[k] ?? 0) - mean
+    vals[k] = a
+    sxx += a * a
+  }
+  if (sxx < 1e-9) return 0
+  let best = -1
+  for (const { t, norm } of templatesFor(grid)) {
+    let sxy = 0
+    for (let k = 0; k < vals.length; k++) sxy += (vals[k] ?? 0) * (t[k] ?? 0)
+    best = Math.max(best, sxy / (Math.sqrt(sxx) * norm))
+  }
+  return best
+}
+
+/** Required lead of the best rotation over the runner-up (whole-QR NCC) before orientation is trusted. */
+const ORIENTATION_GAP = 0.15
+
+/**
+ * Orientation from 4 cyclic rotations. Each is scored by the whole-QR correlation (hundreds of samples);
+ * the winner must also have 3 finder-like corners and a less finder-like 4th, and must beat the
+ * runner-up by ORIENTATION_GAP. Otherwise null (fail safe, never guess). score = orientation confidence.
+ */
 function bestRotation(img: GrayImage, quad: [number, number][], grid: MarkerGrid): Scored | null {
   const fc = finderCentres(grid)
   const moduleUV = QR_SIZE / grid.size
-  let best: Scored | null = null
+  const q: number[] = []
+  const Hs: (Mat3 | null)[] = []
   for (let rot = 0; rot < 4; rot++) {
     const dst = [0, 1, 2, 3].map((i) => quad[(i + rot) % 4] as [number, number])
     const H = homographyFromQuad(UNIT, dst)
-    if (!H) continue
-    const f = [fc.tl, fc.tr, fc.bl].map(([u, v]) => finderness(img, H, moduleUV, u, v))
-    const fe = finderness(img, H, moduleUV, fc.empty[0], fc.empty[1])
-    const minF = Math.min(...f)
-    const margin = f.reduce((p, c) => p + c, 0) / f.length - fe
-    // Three finder-like corners, the 4th clearly less so (heavy blur compresses the margin, hence 0.08).
-    if (minF < 0.4 || margin < 0.08) continue
-    const score = Math.min(1, minF / 0.5)
-    if (!best || margin > best.margin) best = { rot, score, margin }
+    Hs.push(H)
+    q.push(H ? qrCorrelation(img, H, grid) : -1)
   }
-  return best
+  let bi = 0
+  for (let i = 1; i < 4; i++) if ((q[i] ?? -1) > (q[bi] ?? -1)) bi = i
+  let second = -1
+  for (let i = 0; i < 4; i++) if (i !== bi) second = Math.max(second, q[i] ?? -1)
+  const gap = (q[bi] ?? -1) - second
+    process.stdout.write(`q ${q.map((v) => v.toFixed(2))} gap ${gap.toFixed(2)}\n`)
+  const H = Hs[bi]
+  if (!H || gap < ORIENTATION_GAP) return null
+  const f = [fc.tl, fc.tr, fc.bl].map(([u, v]) => finderness(img, H, moduleUV, u, v))
+  const fe = finderness(img, H, moduleUV, fc.empty[0], fc.empty[1])
+  const margin = f.reduce((p, c) => p + c, 0) / f.length - fe
+  if (Math.min(...f) < 0.4 || margin < 0.08) return null
+  return { rot: bi, score: Math.min(1, gap / (2 * ORIENTATION_GAP)), margin }
 }
 
 function insideImage(img: GrayImage, q: [number, number][]): boolean {

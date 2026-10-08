@@ -119,6 +119,42 @@ describe('detectFramedQr', () => {
     expect(e).toBeLessThan(1.5)
   })
 
+  for (const roll of [90, 180, 270, 143]) {
+    it(`small noisy blurred marker, roll ${roll}: correct corner order`, () => {
+      const { image, cornersPx } = scene(
+        { distanceM: 0.55, tiltDeg: 0, yawDeg: 0, rollDeg: roll },
+        { noise: 6, blurPx: 1 },
+      )
+      const d = detectFramedQr(image, grid)
+      expect(d).not.toBeNull()
+      const e = maxErr(d?.corners ?? [], cornersPx)
+      report(`small noisy roll ${roll}`, e)
+      expect(e).toBeLessThan(1.5)
+    })
+  }
+
+  it('beyond-spec sweep (blur 2, noise 12): never a wrong rotation (null is fine)', () => {
+    let wrong = 0
+    let detected = 0
+    let total = 0
+    for (const d of [0.5, 0.56, 0.62]) {
+      for (let roll = 0; roll < 360; roll += 30) {
+        const { image, cornersPx } = scene(
+          { distanceM: d, tiltDeg: 15, yawDeg: 40, rollDeg: roll },
+          { noise: 12, blurPx: 2 },
+        )
+        total++
+        const det = detectFramedQr(image, grid)
+        if (!det) continue
+        detected++
+        if (maxErr(det.corners, cornersPx) > 6) wrong++
+      }
+    }
+    if (process.env['BENCH'])
+      process.stdout.write(`SWEEP detected ${detected}/${total}, wrong ${wrong}\n`)
+    expect(wrong).toBe(0)
+  })
+
   // Card decoys: dark outer quad + lighter inner quad.
   const card = (x: number, y: number, w: number, h: number, b: number): NonNullable<Clutter> => [
     {

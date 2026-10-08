@@ -10,3 +10,14 @@ export { ImuHistory } from './imu/history'
 export { OneEuroFilter } from './fusion/oneEuro'
 export { PoseFusion } from './fusion/fusion'
 export type { FusedPose, MarkerSample } from './fusion/fusion'
+export { createTracker } from './tracker'
+export type {
+  Tracker,
+  TrackerOptions,
+  TrackerPose,
+  TrackerStatus,
+  TrackerError,
+  TrackerStats,
+} from './tracker'
+export { intrinsicsFromSize, projectionForCover } from './pose/intrinsics'
+export type { Intrinsics } from './pose/intrinsics'

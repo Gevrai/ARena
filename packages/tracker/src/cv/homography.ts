@@ -22,7 +22,7 @@ function normalise(pts: [number, number][]): { T: number[]; p: [number, number][
 }
 
 /** Solve A x = b (n x n, row-major) by Gaussian elimination with partial pivoting. null if singular. */
-function solve(A: number[], b: number[], n: number): number[] | null {
+export function solve(A: number[], b: number[], n: number): number[] | null {
   for (let c = 0; c < n; c++) {
     let piv = c
     for (let r = c + 1; r < n; r++)

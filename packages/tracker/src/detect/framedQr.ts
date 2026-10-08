@@ -275,7 +275,6 @@ function bestRotation(img: GrayImage, quad: [number, number][], grid: MarkerGrid
   let second = -1
   for (let i = 0; i < 4; i++) if (i !== bi) second = Math.max(second, q[i] ?? -1)
   const gap = (q[bi] ?? -1) - second
-    process.stdout.write(`q ${q.map((v) => v.toFixed(2))} gap ${gap.toFixed(2)}\n`)
   const H = Hs[bi]
   if (!H || gap < ORIENTATION_GAP) return null
   const f = [fc.tl, fc.tr, fc.bl].map(([u, v]) => finderness(img, H, moduleUV, u, v))

@@ -1,11 +1,43 @@
 <!doctype html>
 <html lang="en">
-<head>
-<meta charset="UTF-8" />
-<meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>ARena tracker demo</title>
-</head>
-<body>
-<h1>ARena tracker demo &mdash; coming soon</h1>
-</body>
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover" />
+    <title>ARena tracker demo</title>
+  </head>
+  <body>
+    <video id="video" playsinline muted autoplay></video>
+    <canvas id="gl"></canvas>
+    <canvas id="overlay"></canvas>
+
+    <div id="hud">
+      <button id="hud-toggle" type="button" aria-label="Toggle HUD">HUD</button>
+      <div id="hud-body">
+        <div><span id="badge">none</span></div>
+        <pre id="stats"></pre>
+        <label><input type="checkbox" id="opt-gyro" /> Gyro</label>
+        <label
+          >Detect res
+          <select id="opt-res">
+            <option>480</option>
+            <option>640</option>
+            <option>960</option>
+          </select>
+        </label>
+        <label
+          >HFOV <span id="hfov-val"></span>&deg;
+          <input type="range" id="opt-hfov" min="50" max="80" step="1" />
+        </label>
+        <label><input type="checkbox" id="opt-corners" /> Show corners</label>
+        <a href="../marker/">marker page</a>
+      </div>
+    </div>
+
+    <div id="start-panel">
+      <p id="start-msg">Point the camera at the ARena card</p>
+      <button id="start" type="button">Start</button>
+    </div>
+
+    <script type="module" src="/src/demo/tracker-demo.ts"></script>
+  </body>
 </html>

@@ -56,7 +56,8 @@ export class PoseFusion {
   private offset: Quat | null = null
   private blendFrom: Quat | null = null
   private blendStart = 0
-  private lastMarkerT: number | null = null
+  private lastMarkerT: number | null = null // capture time (reacquire gap logic)
+  private lastArrivalT: number | null = null // arrival time (freshness / source)
   private lastConfidence = 0
 
   private position: Vec3 = [0, 0, 0]
@@ -94,8 +95,12 @@ export class PoseFusion {
     return quatSlerp(this.blendFrom, off, smoothstep(Math.max(0, p)))
   }
 
-  onMarker(frameTime: number, m: MarkerSample): void {
+  onMarker(frameTime: number, m: MarkerSample, arrivalTime?: number): void {
     const latest = this.imu.latest()
+    this.lastArrivalT = Math.max(
+      arrivalTime ?? latest?.t ?? frameTime,
+      this.lastArrivalT ?? -Infinity,
+    )
     const imuQ = this.useImu && latest ? this.imu.at(frameTime) : null
     const prev = this.lastMarkerT
     const gap = prev === null ? Infinity : frameTime - prev
@@ -142,7 +147,7 @@ export class PoseFusion {
 
   get(now: number): FusedPose {
     const latest = this.imu.latest()
-    const age = this.lastMarkerT === null ? Infinity : now - this.lastMarkerT
+    const age = this.lastArrivalT === null ? Infinity : now - this.lastArrivalT
     const fresh = age <= this.lostAfterMs
     const imuLive = this.useImu && latest !== null && now - latest.t < IMU_LIVE_MS
 

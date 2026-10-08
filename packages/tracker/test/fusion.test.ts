@@ -84,6 +84,8 @@ function cornersFor(tr: Truth, noisePx: number, rnd: () => number): MarkerSample
 interface SimOpts {
   truth: (tMs: number) => Truth
   tEnd: number
+  markerHz?: number
+  jitterMs?: number
   markerWindows?: [number, number][] // frame-time windows where markers exist
   driftAfterMs?: number
   driftDeg?: number
@@ -99,7 +101,7 @@ function simulate(o: SimOpts): PoseFusion {
   const rnd = mulberry32(o.seed ?? 1)
   const f = new PoseFusion({ useImu: o.useImu })
   const latency = 60
-  const pending: { tf: number; sample: MarkerSample }[] = []
+  const pending: { tf: number; at: number; sample: MarkerSample }[] = []
   let nextFrame = 0
   const dtImu = 1000 / 60
   for (let t = 0; t <= o.tEnd; t += dtImu) {
@@ -109,7 +111,7 @@ function simulate(o: SimOpts): PoseFusion {
     if (o.useImu !== false) f.onImu(t, quatMultiply(quatInvert(offsetEff), tr.q))
     while (nextFrame <= t) {
       const tf = nextFrame
-      nextFrame += 1000 / 15
+      nextFrame += 1000 / (o.markerHz ?? 15)
       if (o.markerWindows && !o.markerWindows.some(([a, b]) => tf >= a && tf <= b)) continue
       const trf = o.truth(tf)
       let mq = trf.q
@@ -123,6 +125,7 @@ function simulate(o: SimOpts): PoseFusion {
       }
       pending.push({
         tf,
+        at: tf + latency + (o.jitterMs ? (rnd() * 2 - 1) * o.jitterMs : 0),
         sample: {
           position: trf.p,
           quaternion: quatNormalize(mq),
@@ -133,7 +136,8 @@ function simulate(o: SimOpts): PoseFusion {
         },
       })
     }
-    while (pending.length && (pending[0] as { tf: number }).tf + latency <= t) {
+    pending.sort((a, b) => a.at - b.at)
+    while (pending.length && (pending[0] as { at: number }).at <= t) {
       const p = pending.shift() as { tf: number; sample: MarkerSample }
       f.onMarker(p.tf, p.sample)
     }
@@ -160,9 +164,6 @@ describe('PoseFusion', () => {
         worstPos = Math.max(worstPos, dist(o.position, tr.p))
       },
     })
-    console.log(
-      `[rot30] worst rot err ${worst.toFixed(3)} deg, worst pos err ${(worstPos * 100).toFixed(2)} cm`,
-    )
     expect(worst).toBeLessThan(1.5)
   })
 
@@ -189,9 +190,6 @@ describe('PoseFusion', () => {
     })
     // last marker frame <= 1500; delivered by ~1560; source must be imu 150 ms after that frame
     expect(switchedAt).toBeLessThan(1500 + 150 + 60)
-    console.log(
-      `[lost] imu-follow worst rot err ${worst.toFixed(3)} deg, source switch at ${switchedAt.toFixed(0)} ms`,
-    )
     expect(worst).toBeLessThan(1.5)
   })
 
@@ -221,9 +219,6 @@ describe('PoseFusion', () => {
         if (t >= resumeAt + 60 + 300 && errAt300 < 0) errAt300 = e
       },
     })
-    console.log(
-      `[reacq] err before resume ${errAtResume.toFixed(2)} deg, 300 ms after first marker ${errAt300.toFixed(3)} deg, max frame jump ${maxJump.toFixed(3)} deg`,
-    )
     expect(errAtResume).toBeGreaterThan(8)
     expect(errAt300).toBeLessThan(1)
     expect(maxJump).toBeLessThan(5)
@@ -244,9 +239,49 @@ describe('PoseFusion', () => {
         worst = Math.max(worst, deg(quatAngle(o.quaternion, tr.q)))
       },
     })
-    console.log(`[noimu] worst rot err ${worst.toFixed(3)} deg`)
     expect(src).toBe('marker')
     expect(worst).toBeLessThan(15) // smoothed lag at 30 deg/s with 60 ms latency
+  })
+
+  it('reports source marker on 100% of get() calls at 10 Hz markers with latency and jitter', () => {
+    let total = 0
+    let nonMarker = 0
+    simulate({
+      truth: makeTruth(25, 30),
+      tEnd: 6000,
+      markerHz: 10,
+      jitterMs: 15,
+      noisePx: 0.3,
+      onStep: (t, f) => {
+        if (t < 500) return
+        total++
+        if (f.get(t).source !== 'marker') nonMarker++
+      },
+    })
+    expect(total).toBeGreaterThan(300)
+    expect(nonMarker).toBe(0)
+  })
+
+  it('source becomes imu 150-200 ms after the last marker ARRIVES', () => {
+    // last frame at <=1500 arrives ~60 ms later
+    let lastMarkerSeen = -1
+    let switchAt = -1
+    simulate({
+      truth: makeTruth(25, 0),
+      tEnd: 3000,
+      markerHz: 10,
+      markerWindows: [[0, 1500]],
+      onStep: (t, f) => {
+        const s = f.get(t).source
+        if (s === 'marker') lastMarkerSeen = t
+        else if (switchAt < 0 && t > 1000) switchAt = t
+      },
+    })
+    const sinceLast = switchAt - lastMarkerSeen
+    expect(sinceLast).toBeLessThan(40)
+    // arrival of last marker is ~1560 ms; switch must be 150-200 ms later
+    expect(switchAt).toBeGreaterThan(1500 + 60 + 150 - 20)
+    expect(switchAt).toBeLessThan(1500 + 60 + 200 + 20)
   })
 
   for (const cameraFrame of [false, true]) {
@@ -267,9 +302,6 @@ describe('PoseFusion', () => {
           worstPos = Math.max(worstPos, dist(o.position, tr.p))
         },
       })
-      console.log(
-        `[tilt-noise ${cameraFrame ? 'cam' : 'world'}] worst rot ${worstRot.toFixed(3)} deg, worst pos ${(worstPos * 100).toFixed(3)} cm`,
-      )
       expect(worstRot).toBeLessThan(1.5)
       expect(worstPos).toBeLessThan(0.01)
     })

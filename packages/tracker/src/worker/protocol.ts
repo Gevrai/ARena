@@ -31,4 +31,6 @@ export type FromWorker = {
   K: Intrinsics
   /** The gray buffer, transferred back for reuse. */
   gray: ArrayBuffer
+  /** Set when the frame could not be processed (not initialised, bad size, exception). Pose/corners are null, reprojErrorPx NaN. */
+  error?: string
 }

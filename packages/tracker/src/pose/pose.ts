@@ -2,7 +2,7 @@ import { homographyFromQuad, solve } from '../cv/homography'
 import type { Detection } from '../detect/framedQr'
 import { mat4FromRotationTranslation } from '../math/mat4'
 import type { Mat4 } from '../math/mat4'
-import { quatFromMat3 } from '../math/quat'
+import { quatFromMat3, quatToMat3 } from '../math/quat'
 import type { Mat3, Quat } from '../math/quat'
 import type { Vec3 } from '../math/vec3'
 import type { Intrinsics } from './intrinsics'
@@ -254,4 +254,78 @@ export function poseToWorldFromCamera(p: CvPose): {
   const position: Vec3 = [tm[0], -tm[2], tm[1]]
   const quaternion = quatFromMat3(Rw)
   return { position, quaternion, matrix: mat4FromRotationTranslation(quaternion, position) }
+}
+
+/**
+ * Least-squares camera translation (OpenCV camera-from-marker) given a known rotation R (cv
+ * convention). Linear: each corner gives 2 equations in t:
+ *   fx*t_x - (u-cx)*t_z = (u-cx)*a_z - fx*a_x   (and likewise for y), with a = R*(X, Y, 0).
+ * Null if degenerate or non-finite.
+ */
+export function solveTranslationGivenRotation(
+  corners: Detection['corners'],
+  K: Intrinsics,
+  markerSizeM: number,
+  R: Mat3,
+): { t: Vec3; reprojErrorPx: number } | null {
+  const h = markerSizeM / 2
+  const obj: [number, number][] = [
+    [-h, -h],
+    [h, -h],
+    [h, h],
+    [-h, h],
+  ]
+  if (!(markerSizeM > 0) || !(K.fx > 0) || !(K.fy > 0)) return null
+  if (R.length !== 9 || Array.from(R).some((x) => !Number.isFinite(x))) return null
+  const A = new Array<number>(9).fill(0)
+  const b = new Array<number>(3).fill(0)
+  const px: [number, number][] = []
+  for (let i = 0; i < 4; i++) {
+    const [u, v] = corners[i] as [number, number]
+    if (!Number.isFinite(u) || !Number.isFinite(v)) return null
+    px.push([u, v])
+    const [X, Y] = obj[i] as [number, number]
+    const ax = g(R, 0) * X + g(R, 1) * Y
+    const ay = g(R, 3) * X + g(R, 4) * Y
+    const az = g(R, 6) * X + g(R, 7) * Y
+    const du = u - K.cx
+    const dv = v - K.cy
+    const rows: [number[], number][] = [
+      [[K.fx, 0, -du], du * az - K.fx * ax],
+      [[0, K.fy, -dv], dv * az - K.fy * ay],
+    ]
+    for (const [row, rhs] of rows) {
+      for (let p = 0; p < 3; p++) {
+        for (let q = 0; q < 3; q++)
+          A[p * 3 + q] = (A[p * 3 + q] ?? 0) + (row[p] ?? 0) * (row[q] ?? 0)
+        b[p] = (b[p] ?? 0) + (row[p] ?? 0) * rhs
+      }
+    }
+  }
+  const s = solve(A, b, 3)
+  if (!s || s.some((x) => !Number.isFinite(x))) return null
+  const t: Vec3 = [s[0] ?? 0, s[1] ?? 0, s[2] ?? 0]
+  if (!(t[2] > 0)) return null
+  const err = rms(residuals(Float64Array.from(R), t, obj, px, K))
+  if (!Number.isFinite(err)) return null
+  return { t, reprojErrorPx: err }
+}
+
+/** Inverse of the rotation part of poseToWorldFromCamera: Rw = W R^T C, so R = (W^T Rw C)^T. */
+export function worldFromCameraQuatToCvR(q: Quat): Mat3 {
+  const Rw = quatToMat3(q)
+  const Wt = new Float64Array([1, 0, 0, 0, 0, 1, 0, -1, 0])
+  const C = new Float64Array([1, 0, 0, 0, -1, 0, 0, 0, -1])
+  const Rt = mul3(Wt, mul3(Rw, C))
+  return new Float64Array([
+    g(Rt, 0),
+    g(Rt, 3),
+    g(Rt, 6),
+    g(Rt, 1),
+    g(Rt, 4),
+    g(Rt, 7),
+    g(Rt, 2),
+    g(Rt, 5),
+    g(Rt, 8),
+  ])
 }

@@ -4,8 +4,8 @@
 
 | Task | State | Notes |
 |---|---|---|
-| 1 Scaffold + Pages deploy | todo | |
-| 2 Marker layout + page | todo | |
+| 1 Scaffold + Pages deploy | done | |
+| 2 Marker layout + page | done | client OK, live at /ARena/marker/ |
 | 3 Synth renderer + math | todo | |
 | 4 CV primitives | todo | |
 | 5 Framed-QR detector | todo | |

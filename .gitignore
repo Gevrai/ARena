@@ -3,3 +3,5 @@ dist
 .superpowers/
 *.local
 *.tsbuildinfo
+public/marker-card.svg
+public/marker.svg

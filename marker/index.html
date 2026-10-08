@@ -4,8 +4,40 @@
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <title>ARena marker</title>
+<style>
+  :root { color-scheme: light; }
+  body { margin: 0; font-family: 'Trebuchet MS', 'Segoe UI', Arial, sans-serif; background: #f4f1ec; color: #111; }
+  main { max-width: 36rem; margin: 0 auto; padding: 1.25rem 1rem 2rem; text-align: center; }
+  h1 { font-weight: 900; margin: 0 0 .25rem; }
+  p { margin: .25rem 0 1rem; }
+  #card { background: #fff; box-shadow: 0 4px 18px rgba(0,0,0,.18); width: 85mm; max-width: 100%; margin: 1rem auto; line-height: 0; }
+  #card svg { width: 100%; height: auto; }
+  button { font: inherit; font-weight: 700; padding: .7rem 1.1rem; margin: .25rem; border: 0; border-radius: .6rem; background: #ff5a36; color: #fff; cursor: pointer; }
+  button.secondary { background: #111; }
+  #screen { display: none; position: fixed; inset: 0; background: #fff; align-items: center; justify-content: center; z-index: 10; }
+  #screen.on { display: flex; }
+  #screen svg { width: min(100vw, 100vh); height: min(100vw, 100vh); }
+  @media print {
+    @page { size: 85mm 55mm; margin: 0; }
+    body { background: #fff; }
+    main > :not(#card) { display: none; }
+    main { padding: 0; max-width: none; }
+    #card { box-shadow: none; margin: 0; width: 85mm; }
+  }
+</style>
 </head>
 <body>
-<h1>ARena marker &mdash; coming soon</h1>
+<main>
+  <h1>ARena marker</h1>
+  <p>Print this card, then point your phone at it to play.</p>
+  <div id="card"></div>
+  <div>
+    <button id="print" class="secondary">Print card</button>
+    <button id="show">Show on this screen</button>
+  </div>
+  <p><a href="/ARena/">Back to ARena</a></p>
+</main>
+<div id="screen" role="dialog" aria-label="Marker"></div>
+<script type="module" src="/src/marker-page.ts"></script>
 </body>
 </html>

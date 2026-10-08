@@ -54,6 +54,15 @@ const rotY = (v: Vec3, a: number): Vec3 => [
   -Math.sin(a) * v[0] + Math.cos(a) * v[2],
 ]
 
+/** Truth as seen against a marker plane tilted by `deg` about world X. */
+function tiltTruth(tr: Truth, deg: number): Truth {
+  const r = quatFromAxisAngle([1, 0, 0], deg * DEG)
+  const c = Math.cos(deg * DEG)
+  const s = Math.sin(deg * DEG)
+  const p: Vec3 = [tr.p[0], c * tr.p[1] - s * tr.p[2], s * tr.p[1] + c * tr.p[2]]
+  return { q: quatMultiply(r, tr.q), p }
+}
+
 /** Exact corners of the marker as seen from a world-from-camera pose, plus optional pixel noise. */
 function cornersFor(tr: Truth, noisePx: number, rnd: () => number): MarkerSample['corners'] {
   const R = worldFromCameraQuatToCvR(tr.q)
@@ -91,6 +100,8 @@ interface SimOpts {
   driftDeg?: number
   noisePx?: number
   markerTiltNoiseDeg?: number
+  /** Constant tilt of the marker plane about world X relative to gravity (phone propped up). */
+  markerTiltDeg?: number
   cameraFrameNoise?: boolean
   useImu?: boolean
   seed?: number
@@ -113,7 +124,8 @@ function simulate(o: SimOpts): PoseFusion {
       const tf = nextFrame
       nextFrame += 1000 / (o.markerHz ?? 15)
       if (o.markerWindows && !o.markerWindows.some(([a, b]) => tf >= a && tf <= b)) continue
-      const trf = o.truth(tf)
+      const trf0 = o.truth(tf)
+      const trf = o.markerTiltDeg ? tiltTruth(trf0, o.markerTiltDeg) : trf0
       let mq = trf.q
       if (o.markerTiltNoiseDeg) {
         const ang = rnd() * 2 * Math.PI
@@ -282,6 +294,75 @@ describe('PoseFusion', () => {
     // arrival of last marker is ~1560 ms; switch must be 150-200 ms later
     expect(switchAt).toBeGreaterThan(1500 + 60 + 150 - 20)
     expect(switchAt).toBeLessThan(1500 + 60 + 200 + 20)
+  })
+
+  it('marker tilted 40 deg from gravity -> flat false and the pose follows the marker', () => {
+    const truth = makeTruth(25, 0)
+    let worstRot = 0
+    let worstPos = 0
+    let flatSeen = true
+    let n = 0
+    simulate({
+      truth,
+      tEnd: 3000,
+      noisePx: 0.3,
+      markerTiltDeg: 40,
+      onStep: (t, f, tr) => {
+        if (t < 1000) return
+        const o = f.get(t)
+        const m = tiltTruth(tr, 40)
+        n++
+        if (o.flat) flatSeen = true
+        else flatSeen = false
+        worstRot = Math.max(worstRot, deg(quatAngle(o.quaternion, m.q)))
+        worstPos = Math.max(worstPos, dist(o.position, m.p))
+        expect(o.flat).toBe(false)
+        expect(o.confidence).toBeLessThan(0.55)
+      },
+    })
+    expect(n).toBeGreaterThan(50)
+    expect(flatSeen).toBe(false)
+    expect(worstRot).toBeLessThan(1.5)
+    expect(worstPos).toBeLessThan(0.01)
+  })
+
+  it('flat marker with +-8 deg tilt noise never trips the flat flag', () => {
+    let nonFlat = 0
+    let total = 0
+    simulate({
+      truth: makeTruth(25, 0),
+      tEnd: 4000,
+      noisePx: 0.3,
+      markerTiltNoiseDeg: 8,
+      onStep: (t, f) => {
+        if (t < 500) return
+        total++
+        if (!f.get(t).flat) nonFlat++
+      },
+    })
+    expect(total).toBeGreaterThan(100)
+    expect(nonFlat).toBe(0)
+  })
+
+  it('a corner residual inconsistent with the gravity-locked rotation flags non-flat', () => {
+    const f = new PoseFusion()
+    const tr = makeTruth(25, 0)(0)
+    // IMU consistent with the quaternion (swing 0) but the corners say the marker is rotated.
+    const wrong = tiltTruth(tr, 20)
+    f.onImu(0, quatMultiply(quatInvert(YAW_TRUE), tr.q))
+    f.onMarker(
+      10,
+      {
+        position: tr.p,
+        quaternion: tr.q,
+        corners: cornersFor(wrong, 0, () => 0.5),
+        K,
+        markerSizeM: S,
+        reprojErrorPx: 0.1,
+      },
+      10,
+    )
+    expect(f.get(20).flat).toBe(false)
   })
 
   for (const cameraFrame of [false, true]) {

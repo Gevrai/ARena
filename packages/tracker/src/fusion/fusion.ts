@@ -16,6 +16,11 @@ export interface FusedPose {
   quaternion: Quat
   source: 'marker' | 'imu' | 'none'
   confidence: number
+  /**
+   * False when the latest marker sample disagreed with gravity (marker not lying flat), so the
+   * pose follows the marker alone for that sample. True otherwise (and when there is no data).
+   */
+  flat: boolean
 }
 
 export interface MarkerSample {
@@ -31,6 +36,16 @@ export interface MarkerSample {
 const IDENTITY: Quat = [0, 0, 0, 1]
 const REACQUIRE_ANGLE = (20 * Math.PI) / 180
 const IMU_LIVE_MS = 500
+/** Marker tilt (swing from gravity-up) above which the gravity lock is not trusted. */
+const MAX_SWING = (25 * Math.PI) / 180
+const MIN_RESID_PX = 2
+const RESID_FACTOR = 3
+const NOT_FLAT_CONFIDENCE = 0.5
+
+/** Angle of q away from a pure rotation about +Y (the swing part of swing-twist). */
+function swingAngle(q: Quat): number {
+  return quatAngle(q, yawTwist(q))
+}
 
 /** Keep only the rotation about +Y (swing-twist decomposition). */
 function yawTwist(q: Quat): Quat {
@@ -59,6 +74,7 @@ export class PoseFusion {
   private lastMarkerT: number | null = null // capture time (reacquire gap logic)
   private lastArrivalT: number | null = null // arrival time (freshness / source)
   private lastConfidence = 0
+  private flat = true
 
   private position: Vec3 = [0, 0, 0]
   private readonly posFilter = new OneEuroVec3(1.0, 20)
@@ -115,7 +131,24 @@ export class PoseFusion {
       return
     }
 
-    const target = yawTwist(quatMultiply(m.quaternion, quatInvert(imuQ)))
+    const full = quatMultiply(m.quaternion, quatInvert(imuQ))
+    const target = yawTwist(full)
+    const fusedForTarget = quatMultiply(target, imuQ)
+    const R = worldFromCameraQuatToCvR(fusedForTarget)
+    const sol = solveTranslationGivenRotation(m.corners, m.K, m.markerSizeM, R)
+    const swingBad = swingAngle(full) > MAX_SWING
+    const residBad =
+      sol === null || sol.reprojErrorPx > Math.max(MIN_RESID_PX, RESID_FACTOR * m.reprojErrorPx)
+    if (swingBad || residBad) {
+      // Marker is not flat w.r.t. gravity: trust the marker alone for this sample.
+      this.flat = false
+      this.lastConfidence *= NOT_FLAT_CONFIDENCE
+      this.markerQuat = this.rotFilter.filter(m.quaternion, tSec)
+      this.position = this.posFilter.filter(m.position, tSec)
+      return
+    }
+    this.flat = true
+
     if (this.offset === null) {
       this.offset = target
       this.blendFrom = null
@@ -128,19 +161,12 @@ export class PoseFusion {
       this.offset = yawTwist(quatNormalize(quatSlerp(this.offset, target, a)))
     }
 
+    // Position is solved with the smoothed offset, not the raw target.
     const fusedQ = quatMultiply(this.offset, imuQ)
-    const sol = solveTranslationGivenRotation(
-      m.corners,
-      m.K,
-      m.markerSizeM,
-      worldFromCameraQuatToCvR(fusedQ),
-    )
-    const pos = sol
-      ? poseToWorldFromCamera({
-          R: worldFromCameraQuatToCvR(fusedQ),
-          t: sol.t,
-          reprojErrorPx: 0,
-        }).position
+    const Rf = worldFromCameraQuatToCvR(fusedQ)
+    const solF = solveTranslationGivenRotation(m.corners, m.K, m.markerSizeM, Rf)
+    const pos = solF
+      ? poseToWorldFromCamera({ R: Rf, t: solF.t, reprojErrorPx: 0 }).position
       : m.position
     this.position = this.posFilter.filter(pos, tSec)
   }
@@ -153,31 +179,65 @@ export class PoseFusion {
 
     if (this.useImu && latest && this.offset) {
       const q = quatNormalize(quatMultiply(this.displayedOffset(now), latest.q))
+      if (fresh && !this.flat)
+        return {
+          position: this.position,
+          quaternion: this.markerQuat,
+          source: 'marker',
+          confidence: this.lastConfidence,
+          flat: false,
+        }
       if (fresh)
         return {
           position: this.position,
           quaternion: q,
           source: 'marker',
           confidence: this.lastConfidence,
+          flat: true,
         }
       if (imuLive) {
         const conf = 0.5 * this.lastConfidence * Math.exp(-age / 3000)
-        return { position: this.position, quaternion: q, source: 'imu', confidence: conf }
+        return {
+          position: this.position,
+          quaternion: q,
+          source: 'imu',
+          confidence: conf,
+          flat: this.flat,
+        }
       }
-      return { position: this.position, quaternion: q, source: 'none', confidence: 0 }
+      return {
+        position: this.position,
+        quaternion: q,
+        source: 'none',
+        confidence: 0,
+        flat: this.flat,
+      }
     }
     if (this.useImu && latest && this.lastMarkerT === null) {
-      return { position: this.position, quaternion: latest.q, source: 'none', confidence: 0 }
+      return {
+        position: this.position,
+        quaternion: latest.q,
+        source: 'none',
+        confidence: 0,
+        flat: true,
+      }
     }
     // Marker-only.
     if (this.lastMarkerT === null) {
-      return { position: this.position, quaternion: IDENTITY, source: 'none', confidence: 0 }
+      return {
+        position: this.position,
+        quaternion: IDENTITY,
+        source: 'none',
+        confidence: 0,
+        flat: true,
+      }
     }
     return {
       position: this.position,
       quaternion: this.markerQuat,
       source: fresh ? 'marker' : 'none',
       confidence: fresh ? this.lastConfidence : 0,
+      flat: this.flat,
     }
   }
 }

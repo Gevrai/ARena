@@ -317,6 +317,8 @@ export class PoseFusion {
   get(now: number): FusedPose
 }
 ```
+**Amendment (2026-10-07, controller ruling — gravity-locked):** a ~60 px marker viewed near-frontally gives 5–13° tilt error from 4 corners (ill-conditioning, measured in Task 6). Since the marker lies flat on a table, when IMU is available **the offset is constrained to a rotation about world +Y (yaw only)**: compute the target as before, then keep only its yaw component (swing-twist decomposition about +Y) before slerping. IMU supplies tilt (gravity-referenced). **Position is re-solved with the fused rotation**: `onMarker` receives the detection corners + intrinsics and calls `solveTranslationGivenRotation(corners, K, markerSizeM, worldFromCameraQuatToCvR(fusedQ))` (Task 6), then `poseToWorldFromCamera` for the camera position, then the One Euro filter. Signature becomes `onMarker(frameTime, marker: { position: Vec3; quaternion: Quat; corners: Detection['corners']; K: Intrinsics; markerSizeM: number; reprojErrorPx: number })`. Without IMU, fall back to the full marker pose as described below. Add a test: IMU tilt is correct and marker rotation is noisy by ±8° in tilt → fused tilt error < 1.5° and the position error stays < 1 cm at 0.4 m.
+
 Fusion model:
 - Keep `offset: Quat` such that `worldFromCam ≈ offset · imuQ`.
 - On a marker sample at `frameTime`, `target = markerQ · inverse(imuHistory.at(frameTime))`. If no marker was seen in the last `lostAfterMs`, or the angle(offset, target) > 20°, start a `reacquireBlendMs` blend to target. Otherwise slerp offset toward target by `1 − exp(−correctionRate·dt)`.

@@ -186,15 +186,19 @@ export function renderSynthetic(
 
 /**
  * Build a camera-from-marker pose (OpenCV: x right, y down, z forward).
- *  - distanceM: camera centre to marker centre.
+ *  - distanceM: camera centre to marker centre; ||t|| === distanceM exactly, also with an offset.
  *  - tiltDeg: angle between the optical axis and the marker normal (0 = head-on).
  *  - yawDeg: azimuth of the viewing direction around the marker normal. The camera centre sits at
- *    marker-frame azimuth yaw (measured from +x towards +y, i.e. 0 = camera displaced to the
- *    marker's right, 90 = towards the bottom edge).
- *  - rollDeg: rotation of the camera about its optical axis.
- *  - offsetPx: shift of the marker centre in the image relative to the image centre.
- *    Implemented by translating the marker in camera space (after rotation) so the centre
- *    lands exactly at (cx+dx, cy+dy); it assumes the default intrinsics (640x480, 65 deg hfov).
+ *    marker-frame azimuth yaw, measured from +x towards +y: yaw 0 = camera displaced towards the
+ *    marker's right, so with tilt > 0 the RIGHT edge is nearer (longer in the image) and the left
+ *    edge shorter; yaw 90 = displaced towards the bottom edge, so the BOTTOM edge is longer and
+ *    the top edge shorter; yaw 180 / 270 mirror these.
+ *  - rollDeg: rotation of the camera about its optical axis. Positive roll rotates the marker
+ *    counter-clockwise in the image (e.g. roll +90 moves marker TL to the image bottom-left).
+ *  - offsetPx: shift of the marker centre in the image relative to the image centre. Implemented
+ *    by translating the marker in camera space along the pixel ray, then rescaling t to norm
+ *    distanceM, so the centre lands exactly at (cx+dx, cy+dy). The intrinsics used for this are
+ *    intrinsicsFromSize(width, height, hfovDeg); pass the same values as renderSynthetic's options.
  * At tilt=yaw=roll=0: R = I, t = (0,0,d); marker top at image top, left at left.
  */
 export function lookAtPose(opts: {
@@ -203,6 +207,9 @@ export function lookAtPose(opts: {
   yawDeg: number
   rollDeg: number
   offsetPx?: [number, number]
+  width?: number
+  height?: number
+  hfovDeg?: number
 }): SynthPose {
   const rad = Math.PI / 180
   const tilt = opts.tiltDeg * rad
@@ -210,7 +217,7 @@ export function lookAtPose(opts: {
   const roll = opts.rollDeg * rad
   // Camera centre in marker coords sits on the viewer side (z < 0); optical axis f points at the centre.
   const f: Vec3 = [-Math.sin(tilt) * Math.cos(yaw), -Math.sin(tilt) * Math.sin(yaw), Math.cos(tilt)]
-  // Camera y (down) = marker y (down) projected perpendicular to f; x = y × z.
+  // Camera y (down) = marker y (down) projected perpendicular to f; x = y x z.
   const ey: Vec3 = [0, 1, 0]
   const k = vec3Dot(ey, f)
   const yc = vec3Normalize([ey[0] - k * f[0], ey[1] - k * f[1], ey[2] - k * f[2]])
@@ -221,8 +228,11 @@ export function lookAtPose(opts: {
   const yr: Vec3 = [-s * xc[0] + c * yc[0], -s * xc[1] + c * yc[1], -s * xc[2] + c * yc[2]]
   const R = new Float64Array([...xr, ...yr, ...f])
   const d = opts.distanceM
-  const K = intrinsicsFromSize(640, 480, 65)
+  const K = intrinsicsFromSize(opts.width ?? 640, opts.height ?? 480, opts.hfovDeg ?? 65)
   const [ox, oy] = opts.offsetPx ?? [0, 0]
-  // The marker centre is on the optical axis at depth d, so t = (0,0,d) before the offset.
-  return { R, t: [(ox * d) / K.fx, (oy * d) / K.fy, d] }
+  // Direction of the pixel ray through the desired centre location; t = d * unit(ray).
+  const a = ox / K.fx
+  const b = oy / K.fy
+  const n = Math.sqrt(a * a + b * b + 1)
+  return { R, t: [(d * a) / n, (d * b) / n, d / n] }
 }

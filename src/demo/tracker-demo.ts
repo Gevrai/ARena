@@ -43,7 +43,7 @@ const optCorners = byId<HTMLInputElement>('opt-corners')
 interface Settings {
   gyro: boolean
   detectWidth: number
-  hfov: number
+  fov: number
   corners: boolean
   hudCollapsed: boolean
 }
@@ -51,7 +51,7 @@ const KEY = 'arena-tracker-demo'
 const defaults: Settings = {
   gyro: true,
   detectWidth: 640,
-  hfov: 65,
+  fov: 65,
   corners: false,
   hudCollapsed: false,
 }
@@ -59,13 +59,14 @@ function loadSettings(): Settings {
   try {
     const raw = localStorage.getItem(KEY)
     if (raw) {
-      const p = JSON.parse(raw) as Partial<Settings>
+      // `hfov` is the pre-rename key (same value, now the long-side FOV): keep it compatible.
+      const p = JSON.parse(raw) as Partial<Settings> & { hfov?: number }
       return {
         gyro: typeof p.gyro === 'boolean' ? p.gyro : defaults.gyro,
         detectWidth: [480, 640, 960].includes(Number(p.detectWidth))
           ? Number(p.detectWidth)
           : defaults.detectWidth,
-        hfov: Math.min(80, Math.max(50, Number(p.hfov) || defaults.hfov)),
+        fov: Math.min(80, Math.max(50, Number(p.fov ?? p.hfov) || defaults.fov)),
         corners: typeof p.corners === 'boolean' ? p.corners : defaults.corners,
         hudCollapsed: p.hudCollapsed === true,
       }
@@ -87,7 +88,7 @@ function saveSettings(): void {
 // ---- tracker ----
 const tracker = createTracker({
   video,
-  hfovDeg: settings.hfov,
+  fovDeg: settings.fov,
   detectWidth: settings.detectWidth,
   useImu: settings.gyro,
 })
@@ -139,8 +140,8 @@ resize()
 // ---- HUD ----
 optGyro.checked = settings.gyro
 optRes.value = String(settings.detectWidth)
-optHfov.value = String(settings.hfov)
-hfovVal.textContent = String(settings.hfov)
+optHfov.value = String(settings.fov)
+hfovVal.textContent = String(settings.fov)
 optCorners.checked = settings.corners
 hud.classList.toggle('collapsed', settings.hudCollapsed)
 
@@ -159,9 +160,9 @@ optRes.addEventListener('change', () => {
   saveSettings()
 })
 optHfov.addEventListener('input', () => {
-  settings.hfov = Number(optHfov.value)
-  hfovVal.textContent = String(settings.hfov)
-  tracker.setOptions({ hfovDeg: settings.hfov })
+  settings.fov = Number(optHfov.value)
+  hfovVal.textContent = String(settings.fov)
+  tracker.setOptions({ fovDeg: settings.fov })
   saveSettings()
 })
 optCorners.addEventListener('change', () => {
@@ -175,6 +176,7 @@ const ERROR_TEXT: Record<TrackerError, string> = {
     'Camera access was denied. Allow the camera for this site in your browser settings, then retry.',
   'no-camera': 'No camera was found on this device.',
   'insecure-context': 'The camera needs a secure (https) connection.',
+  'camera-interrupted': 'The camera was interrupted. Tap retry to resume.',
   unknown: 'Could not start the camera. Please retry.',
 }
 const INSTRUCTION = 'Point the camera at the ARena card'

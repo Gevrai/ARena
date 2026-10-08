@@ -8,12 +8,14 @@ export interface Intrinsics {
 }
 
 /**
- * Pinhole intrinsics from an image size and horizontal FOV (square pixels).
+ * Pinhole intrinsics from an image size and the FOV along the image's LONG side (square pixels).
+ * Phones deliver rotated video in portrait (e.g. 720x1280), so the FOV is defined on max(w, h)
+ * and portrait and landscape frames from the same sensor share one focal length.
  * Pixel convention: pixel (i,j) covers [i,i+1)x[j,j+1), centre at (i+0.5,j+0.5);
  * the principal point is the exact image centre (width/2, height/2).
  */
-export function intrinsicsFromSize(width: number, height: number, hfovDeg = 65): Intrinsics {
-  const f = width / 2 / Math.tan((hfovDeg * Math.PI) / 360)
+export function intrinsicsFromSize(width: number, height: number, fovDeg = 65): Intrinsics {
+  const f = Math.max(width, height) / 2 / Math.tan((fovDeg * Math.PI) / 360)
   return { fx: f, fy: f, cx: width / 2, cy: height / 2, width, height }
 }
 

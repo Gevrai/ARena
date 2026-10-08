@@ -4,7 +4,10 @@ import { createTracker } from '../src/tracker'
 import type { TrackerStatus } from '../src/tracker'
 import { intrinsicsFromSize, projectionForCover } from '../src/pose/intrinsics'
 import { mat4FromRotationTranslation, mat4Invert } from '../src/math/mat4'
-import { quatFromAxisAngle } from '../src/math/quat'
+import { cameraYawFromQuat, quatFromAxisAngle, quatMultiply } from '../src/math/quat'
+import { estimatePose } from '../src/pose/pose'
+import type { Detection } from '../src/detect/framedQr'
+import { lookAtPose, renderSynthetic } from './synth'
 import type { Vec3 } from '../src/math/vec3'
 
 class FakeWorker {
@@ -24,6 +27,28 @@ class FakeWorker {
   }
 }
 
+type Meta = { captureTime?: number; expectedDisplayTime?: number }
+
+function makeTarget() {
+  const handlers = new Map<string, Set<() => void>>()
+  return {
+    handlers,
+    addEventListener(t: string, f: () => void) {
+      if (!handlers.has(t)) handlers.set(t, new Set())
+      handlers.get(t)!.add(f)
+    },
+    removeEventListener(t: string, f: () => void) {
+      handlers.get(t)?.delete(f)
+    },
+    emit(t: string) {
+      for (const f of [...(handlers.get(t) ?? [])]) f()
+    },
+    count(t: string) {
+      return handlers.get(t)?.size ?? 0
+    },
+  }
+}
+
 function makeVideo() {
   const v = {
     srcObject: null as unknown,
@@ -36,8 +61,9 @@ function makeVideo() {
     setAttribute(k: string, val: unknown) {
       this.attrs[k] = val
     },
-    cb: null as null | (() => void),
-    requestVideoFrameCallback(cb: () => void) {
+    ...makeTarget(),
+    cb: null as null | ((now?: number, md?: Meta) => void),
+    requestVideoFrameCallback(cb: (now?: number, md?: Meta) => void) {
       this.cb = cb
       return 1
     },
@@ -47,7 +73,7 @@ function makeVideo() {
 }
 
 function makeStream() {
-  const track = { stop: vi.fn() }
+  const track = { stop: vi.fn(), readyState: 'live', ...makeTarget() }
   return { stream: { getTracks: () => [track] }, track }
 }
 
@@ -415,4 +441,312 @@ describe('projectionForCover', () => {
       }
     })
   }
+})
+
+describe('portrait FOV', () => {
+  it('intrinsics for 1280x720 and 720x1280 share one focal length', () => {
+    const a = intrinsicsFromSize(1280, 720, 65)
+    const b = intrinsicsFromSize(720, 1280, 65)
+    expect(b.fx).toBeCloseTo(a.fx, 9)
+    expect(b.fy).toBeCloseTo(a.fy, 9)
+    expect(b.cx).toBe(360)
+    expect(b.cy).toBe(640)
+  })
+
+  it('same marker distance gives the same pose depth in portrait and landscape', () => {
+    const depth = (w: number, h: number): number => {
+      const pose = lookAtPose({
+        distanceM: 0.3,
+        tiltDeg: 20,
+        yawDeg: 30,
+        rollDeg: 0,
+        width: w,
+        height: h,
+      })
+      const { cornersPx, K } = renderSynthetic(pose, { width: w, height: h })
+      const est = estimatePose(cornersPx as Detection['corners'], K, 0.05)
+      return est!.t[2]
+    }
+    const land = depth(1280, 720)
+    const port = depth(720, 1280)
+    expect(land).toBeGreaterThan(0.25)
+    expect(Math.abs(port - land)).toBeLessThan(0.002)
+  })
+
+  it('projectionMatrix uses the long side in portrait video', () => {
+    const { tracker, video } = mk()
+    video.videoWidth = 720
+    video.videoHeight = 1280
+    const P = tracker.projectionMatrix(720, 1280, 0.01, 10)
+    const K = intrinsicsFromSize(1280, 720, 65)
+    expect(P[0]).toBeCloseTo((2 * K.fx) / 720, 5)
+  })
+
+  it('hfovDeg alias is still accepted', () => {
+    const { tracker, video } = mk({ hfovDeg: 50 })
+    const P = tracker.projectionMatrix(1280, 720, 0.01, 10)
+    expect(P[0]).toBeCloseTo((2 * intrinsicsFromSize(1280, 720, 50).fx) / 1280, 5)
+    tracker.setOptions({ fovDeg: 70 })
+    expect(tracker.projectionMatrix(1280, 720, 0.01, 10)[0]).toBeCloseTo(
+      (2 * intrinsicsFromSize(1280, 720, 70).fx) / 1280,
+      5,
+    )
+    void video
+  })
+})
+
+describe('timestamps', () => {
+  const frameTs = (): number =>
+    (
+      FakeWorker.last!.posted.filter((p) => p.msg.type === 'frame').at(-1)!.msg as unknown as {
+        timestamp: number
+      }
+    ).timestamp
+
+  it('uses rvfc captureTime', async () => {
+    const { tracker, video } = mk({ useImu: false })
+    await tracker.start()
+    video.cb!(5000, { captureTime: 4321.5, expectedDisplayTime: 4400 })
+    expect(frameTs()).toBe(4321.5)
+    tracker.stop()
+  })
+  it('captureLatencyMs is subtracted from captureTime when given', async () => {
+    const { tracker, video } = mk({ useImu: false, captureLatencyMs: 10 })
+    await tracker.start()
+    video.cb!(5000, { captureTime: 4000 })
+    expect(frameTs()).toBe(3990)
+    tracker.stop()
+  })
+  it('falls back to expectedDisplayTime minus one frame', async () => {
+    const { tracker, video } = mk({ useImu: false })
+    await tracker.start()
+    video.cb!(0, { expectedDisplayTime: 1000 })
+    expect(frameTs()).toBeCloseTo(1000 - 33, 0)
+    const w = FakeWorker.last!
+    const id = (w.posted.at(-1)!.msg as { id: number }).id
+    w.onmessage!({
+      data: {
+        type: 'result',
+        id,
+        timestamp: 0,
+        pose: null,
+        corners: null,
+        reprojErrorPx: NaN,
+        detectMs: 1,
+        K: intrinsicsFromSize(640, 360),
+        gray: new ArrayBuffer(640 * 360),
+      },
+    })
+    video.cb!(0, { expectedDisplayTime: 1020 }) // 20 ms frame period learned
+    expect(frameTs()).toBeCloseTo(1020 - 20, 0)
+    tracker.stop()
+  })
+  it('no metadata: performance.now() minus the default 40 ms latency', async () => {
+    const { tracker, video } = mk({ useImu: false })
+    await tracker.start()
+    vi.spyOn(performance, 'now').mockReturnValue(7000)
+    video.cb!()
+    expect(frameTs()).toBe(6960)
+    vi.restoreAllMocks()
+    tracker.stop()
+  })
+  it('IMU events use ev.timeStamp', async () => {
+    const { tracker } = mk()
+    await tracker.start()
+    expect(listeners['deviceorientation']).toBeDefined()
+    listeners['deviceorientation']!({ alpha: 0, beta: 90, gamma: 0, timeStamp: 123 })
+    // observable only through fusion; ensure it does not throw and imu stays active
+    expect(tracker.stats().imu).toBe(true)
+    tracker.stop()
+  })
+})
+
+describe('recovery', () => {
+  let docL: ReturnType<typeof makeTarget> & { visibilityState: string }
+  beforeEach(() => {
+    docL = { ...makeTarget(), visibilityState: 'visible' }
+    vi.stubGlobal('document', docL)
+  })
+  const gumMock = (): ReturnType<typeof vi.fn> =>
+    navigator.mediaDevices.getUserMedia as unknown as ReturnType<typeof vi.fn>
+
+  it('track ended then visible: getUserMedia again and the loop resumes', async () => {
+    const first = makeStream()
+    const second = makeStream()
+    const gum = vi.fn().mockResolvedValueOnce(first.stream).mockResolvedValueOnce(second.stream)
+    vi.stubGlobal('navigator', { mediaDevices: { getUserMedia: gum } })
+    const { tracker, video } = mk({ useImu: false })
+    await tracker.start()
+    const w = FakeWorker.last!
+    docL.visibilityState = 'hidden'
+    docL.emit('visibilitychange')
+    first.track.readyState = 'ended'
+    first.track.emit('ended')
+    expect(gum).toHaveBeenCalledTimes(1)
+    docL.visibilityState = 'visible'
+    docL.emit('visibilitychange')
+    await vi.waitFor(() => expect(gum).toHaveBeenCalledTimes(2))
+    await vi.waitFor(() => expect(video.srcObject).toBe(second.stream))
+    expect(FakeWorker.last).toBe(w) // worker reused
+    expect(w.terminated).toBe(false)
+    expect(first.track.stop).toHaveBeenCalled()
+    const n = w.posted.filter((p) => p.msg.type === 'frame').length
+    video.cb!()
+    expect(w.posted.filter((p) => p.msg.type === 'frame').length).toBe(n + 1)
+    tracker.stop()
+  })
+
+  it('hidden pauses the loop; visible resumes without a new camera when the track is live', async () => {
+    const { tracker, video } = mk({ useImu: false })
+    await tracker.start()
+    docL.visibilityState = 'hidden'
+    docL.emit('visibilitychange')
+    expect(video.cancelVideoFrameCallback).toHaveBeenCalled()
+    const w = FakeWorker.last!
+    video.cb!() // a stale callback must not grab
+    expect(w.posted.filter((p) => p.msg.type === 'frame')).toHaveLength(0)
+    docL.visibilityState = 'visible'
+    docL.emit('visibilitychange')
+    expect(gumMock()).toHaveBeenCalledTimes(1)
+    video.cb!()
+    expect(w.posted.filter((p) => p.msg.type === 'frame')).toHaveLength(1)
+    tracker.stop()
+  })
+
+  it('failed re-acquisition -> status error camera-interrupted', async () => {
+    const first = makeStream()
+    const gum = vi
+      .fn()
+      .mockResolvedValueOnce(first.stream)
+      .mockRejectedValueOnce(Object.assign(new Error('gone'), { name: 'NotReadableError' }))
+    vi.stubGlobal('navigator', { mediaDevices: { getUserMedia: gum } })
+    const { tracker } = mk({ useImu: false })
+    const seen: TrackerStatus[] = []
+    tracker.onStatus((s) => seen.push(s))
+    await tracker.start()
+    first.track.readyState = 'ended'
+    first.track.emit('ended')
+    await vi.waitFor(() =>
+      expect(seen.at(-1)).toEqual({ state: 'error', reason: 'camera-interrupted' }),
+    )
+  })
+
+  it('restart() re-acquires and rejects with camera-interrupted on failure', async () => {
+    const first = makeStream()
+    const second = makeStream()
+    const gum = vi
+      .fn()
+      .mockResolvedValueOnce(first.stream)
+      .mockResolvedValueOnce(second.stream)
+      .mockRejectedValueOnce(new Error('nope'))
+    vi.stubGlobal('navigator', { mediaDevices: { getUserMedia: gum } })
+    const { tracker, video } = mk({ useImu: false })
+    await tracker.start()
+    await tracker.restart()
+    expect(video.srcObject).toBe(second.stream)
+    await expect(tracker.restart()).rejects.toMatchObject({ code: 'camera-interrupted' })
+  })
+
+  it('stop() removes every listener', async () => {
+    const { stream, track } = makeStream()
+    vi.stubGlobal('navigator', { mediaDevices: { getUserMedia: vi.fn(async () => stream) } })
+    const { tracker, video } = mk()
+    await tracker.start()
+    expect(video.count('pause')).toBe(1)
+    expect(docL.count('visibilitychange')).toBe(1)
+    expect(track.count('ended')).toBe(1)
+    tracker.stop()
+    expect(video.count('pause')).toBe(0)
+    expect(docL.count('visibilitychange')).toBe(0)
+    expect(track.count('ended')).toBe(0)
+    expect(removed).toContain('deviceorientation')
+  })
+})
+
+describe('concurrent start()', () => {
+  it('two start() calls share one getUserMedia and both resolve after it', async () => {
+    let resolveGum!: (s: unknown) => void
+    const { stream } = makeStream()
+    const gum = vi.fn(() => new Promise((r) => (resolveGum = r)))
+    vi.stubGlobal('navigator', { mediaDevices: { getUserMedia: gum } })
+    const { tracker } = mk({ useImu: false })
+    const a = tracker.start()
+    const b = tracker.start()
+    expect(gum).toHaveBeenCalledTimes(1)
+    let bDone = false
+    void b.then(() => (bDone = true))
+    await Promise.resolve()
+    expect(bDone).toBe(false)
+    resolveGum(stream)
+    await Promise.all([a, b])
+    expect(bDone).toBe(true)
+    expect(gum).toHaveBeenCalledTimes(1)
+    expect(FakeWorker.last).not.toBeNull()
+    tracker.stop()
+  })
+})
+
+describe('pose extras', () => {
+  it('cameraYaw and flat are exposed', async () => {
+    const { tracker, video } = mk({ useImu: false })
+    await tracker.start()
+    expect(tracker.getPose()).toMatchObject({ cameraYaw: 0, flat: true, source: 'none' })
+    video.cb!()
+    const w = FakeWorker.last!
+    const id = (w.posted.at(-1)!.msg as { id: number }).id
+    // camera looking towards -X: world-from-camera rotation +90 deg about Y
+    const q = quatFromAxisAngle([0, 1, 0], Math.PI / 2)
+    w.onmessage!({
+      data: {
+        type: 'result',
+        id,
+        timestamp: performance.now(),
+        pose: { position: [0, 0.2, 0], quaternion: q },
+        corners: [
+          [1, 1],
+          [2, 1],
+          [2, 2],
+          [1, 2],
+        ],
+        reprojErrorPx: 0.5,
+        detectMs: 1,
+        K: intrinsicsFromSize(640, 360),
+        gray: new ArrayBuffer(640 * 360),
+      },
+    })
+    const p = tracker.getPose()
+    expect(p.source).toBe('marker')
+    expect(p.flat).toBe(true)
+    expect(p.cameraYaw).toBeCloseTo(Math.PI / 2, 5)
+    tracker.stop()
+  })
+})
+
+describe('cameraYawFromQuat', () => {
+  const Y: Vec3 = [0, 1, 0]
+  const X: Vec3 = [1, 0, 0]
+  it('identity looks towards -Z: yaw 0', () => {
+    expect(cameraYawFromQuat([0, 0, 0, 1])).toBeCloseTo(0, 9)
+  })
+  it('rotation about +Y by theta gives yaw theta (CCW from above)', () => {
+    for (const d of [-170, -90, -30, 30, 90, 135]) {
+      const th = (d * Math.PI) / 180
+      expect(cameraYawFromQuat(quatFromAxisAngle(Y, th))).toBeCloseTo(th, 9)
+    }
+  })
+  it('looking towards +X is -90 deg, towards +Z is 180 deg', () => {
+    expect(cameraYawFromQuat(quatFromAxisAngle(Y, -Math.PI / 2))).toBeCloseTo(-Math.PI / 2, 9)
+    expect(Math.abs(cameraYawFromQuat(quatFromAxisAngle(Y, Math.PI)))).toBeCloseTo(Math.PI, 9)
+  })
+  it('pitch does not change the heading', () => {
+    const q = quatMultiply(quatFromAxisAngle(Y, 0.7), quatFromAxisAngle(X, -0.6))
+    expect(cameraYawFromQuat(q)).toBeCloseTo(0.7, 9)
+  })
+  it('looking straight down uses the top of the screen', () => {
+    // pitch -90 about X: forward (-Z) -> -Y. Screen top (+Y) -> -Z : heading 0.
+    const down = quatFromAxisAngle(X, -Math.PI / 2)
+    expect(cameraYawFromQuat(down)).toBeCloseTo(0, 6)
+    const turned = quatMultiply(quatFromAxisAngle(Y, 0.5), down)
+    expect(cameraYawFromQuat(turned)).toBeCloseTo(0.5, 6)
+  })
 })

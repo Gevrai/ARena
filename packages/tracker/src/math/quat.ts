@@ -73,9 +73,15 @@ export function quatSlerp(a: Quat, b: Quat, t: number): Quat {
 /** Rotation matrix (row-major) to unit quaternion. */
 export function quatFromMat3(m: Mat3): Quat {
   const g = (i: number): number => m[i] ?? 0
-  const m00 = g(0), m01 = g(1), m02 = g(2)
-  const m10 = g(3), m11 = g(4), m12 = g(5)
-  const m20 = g(6), m21 = g(7), m22 = g(8)
+  const m00 = g(0),
+    m01 = g(1),
+    m02 = g(2)
+  const m10 = g(3),
+    m11 = g(4),
+    m12 = g(5)
+  const m20 = g(6),
+    m21 = g(7),
+    m22 = g(8)
   const tr = m00 + m11 + m22
   let q: Quat
   if (tr > 0) {
@@ -98,8 +104,35 @@ export function quatFromMat3(m: Mat3): Quat {
 export function quatToMat3(q: Quat): Mat3 {
   const [x, y, z, w] = q
   return new Float64Array([
-    1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w),
-    2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w),
-    2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y),
+    1 - 2 * (y * y + z * z),
+    2 * (x * y - z * w),
+    2 * (x * z + y * w),
+    2 * (x * y + z * w),
+    1 - 2 * (x * x + z * z),
+    2 * (y * z - x * w),
+    2 * (x * z - y * w),
+    2 * (y * z + x * w),
+    1 - 2 * (x * x + y * y),
   ])
+}
+
+/**
+ * Heading of a world-from-camera rotation about world +Y, radians in (-PI, PI].
+ * Angle of the camera's forward vector (-Z) projected on the XZ plane, 0 = looking towards world
+ * -Z, positive = counter-clockwise seen from above (+Y), i.e. looking towards -X is +PI/2.
+ * When looking (almost) straight up or down the camera's up vector (+Y) is used instead, which
+ * is the direction the top of the screen points.
+ */
+export function cameraYawFromQuat(q: Quat): number {
+  const m = quatToMat3(q)
+  const g = (i: number): number => m[i] ?? 0
+  // columns of the rotation: camera +Y = (m1, m4, m7), camera +Z = (m2, m5, m8); forward = -Z.
+  const fx = -g(2)
+  const fz = -g(8)
+  if (Math.hypot(fx, fz) > 1e-3) return Math.atan2(-fx, -fz)
+  // Looking down (forward.y = -m5 < 0): the top of the screen is the heading; looking up: its opposite.
+  const sign = g(5) > 0 ? 1 : -1
+  const vx = sign * g(1)
+  const vz = sign * g(7)
+  return Math.atan2(-vx, -vz)
 }

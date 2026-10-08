@@ -3,6 +3,7 @@ import { PoseFusion } from './fusion/fusion'
 import { deviceOrientationToQuat, requestMotionPermission } from './imu/orientation'
 import { DEFAULT_URL } from './marker/layout'
 import { mat4FromRotationTranslation } from './math/mat4'
+import { cameraYawFromQuat } from './math/quat'
 import type { Quat } from './math/quat'
 import type { Vec3 } from './math/vec3'
 import { toGray } from './cv/image'
@@ -11,7 +12,8 @@ import { intrinsicsFromSize, projectionForCover } from './pose/intrinsics'
 import { FramePump } from './worker/framePump'
 import type { FromWorker, ToWorker } from './worker/protocol'
 
-export type TrackerError = 'camera-denied' | 'no-camera' | 'insecure-context' | 'unknown'
+export type TrackerError =
+  'camera-denied' | 'no-camera' | 'insecure-context' | 'camera-interrupted' | 'unknown'
 export type TrackerStatus = {
   state: 'idle' | 'starting' | 'tracking' | 'lost' | 'error'
   reason?: TrackerError
@@ -20,8 +22,18 @@ export interface TrackerOptions {
   video: HTMLVideoElement
   /** Marker outer size in mm. Default 50. */
   markerSizeMm?: number
-  /** Assumed horizontal FOV in degrees. Default 65. */
+  /**
+   * Assumed camera FOV in degrees along the video's LONG side (max(videoWidth, videoHeight)), so
+   * portrait (rotated) and landscape video share one focal length. Default 65.
+   */
+  fovDeg?: number
+  /** @deprecated Alias of `fovDeg` (it was applied to the video width, wrong in portrait). */
   hfovDeg?: number
+  /**
+   * Capture-to-grab latency in ms, subtracted from the frame timestamp. Default 0 when the
+   * requestVideoFrameCallback metadata provides `captureTime`, 40 on the rAF / no-metadata path.
+   */
+  captureLatencyMs?: number
   /** Detection image width in px. Default 640. */
   detectWidth?: number
   /** Fuse device orientation. Default true. */
@@ -29,13 +41,46 @@ export interface TrackerOptions {
   /** URL encoded in the marker. Default DEFAULT_URL. */
   url?: string
 }
+/**
+ * Camera pose in the marker (world) frame.
+ *
+ * World frame: origin at the marker centre, +Y up (out of the card), +X towards the card's right
+ * edge, +Z towards the card's bottom edge. Units are metres. The camera frame is the three.js one
+ * (+X right, +Y up, looking down -Z).
+ *
+ * Show game content when `source !== 'none'`: 'imu' means the marker was seen recently and the
+ * pose is dead-reckoned from the gyro (status 'lost' includes imu-only), 'none' means there is no
+ * usable pose and `matrix` is identity (hide content).
+ */
 export interface TrackerPose {
-  /** World-from-camera, column-major (usable as three.js camera.matrixWorld). */
+  /**
+   * World-from-camera transform, column-major, metres: assign it directly to a three.js
+   * `camera.matrixWorld` (with matrixAutoUpdate = false). A fresh array on every getPose() call.
+   */
   matrix: Float32Array
+  /** Camera position in the world frame, metres. */
   position: Vec3
+  /** Camera orientation (world-from-camera) as a unit quaternion [x, y, z, w]. */
   quaternion: Quat
   source: 'marker' | 'imu' | 'none'
+  /** 0..1, lowered by reprojection error, IMU-only age and non-flat markers. */
   confidence: number
+  /**
+   * True when the marker lies flat (consistent with gravity) so the gravity-locked fusion is in
+   * use. False when the latest marker sample disagreed with gravity (swing > 25 degrees or the
+   * gravity-locked reprojection residual much larger than the marker-only one, e.g. the card
+   * shown on a propped-up phone): the pose then follows the marker alone for that sample and
+   * confidence is halved. Always true when there is no pose.
+   */
+  flat: boolean
+  /**
+   * Camera heading about world +Y in radians, in (-PI, PI]: the angle of the camera's forward
+   * vector (-Z) projected on the XZ plane. 0 = looking towards world -Z (the card's top edge),
+   * positive = counter-clockwise seen from above (looking towards -X is +PI/2). When looking
+   * straight down the direction of the top of the screen is used. 0 when source is 'none'.
+   * Use it to rotate joystick input into the world frame.
+   */
+  cameraYaw: number
 }
 export interface TrackerStats {
   detectHz: number
@@ -48,18 +93,40 @@ export interface TrackerStats {
   /** Last worker-reported error message, if any (extension to the original brief). */
   lastError?: string
 }
+/**
+ * AR marker tracker. World frame: origin at the marker centre, +Y up, +X to the card's right,
+ * +Z to the card's bottom, metres; see {@link TrackerPose}. Show content when
+ * `getPose().source !== 'none'` (status 'lost' includes imu-only dead reckoning).
+ */
 export interface Tracker {
-  /** Call from a user gesture. Rejects with an Error whose `.code` is a TrackerError. */
+  /**
+   * Call from a user gesture. Rejects with an Error whose `.code` is a TrackerError. Calling it
+   * while already starting returns the in-flight promise.
+   */
   start(): Promise<void>
   stop(): void
-  /** Fused pose; source 'none' returns identity (hide content). */
+  /**
+   * Re-acquire the camera (reusing the worker) after an interruption, or start from scratch when
+   * not running. Rejects with code 'camera-interrupted' (status error) if the camera is gone.
+   * Normally unnecessary: backgrounding and track end are recovered automatically.
+   */
+  restart(): Promise<void>
+  /** Fused pose; source 'none' returns identity (hide content). Allocates on every call. */
   getPose(): TrackerPose
   /** Projection for a canvas of viewW×viewH showing the video with object-fit: cover. */
   projectionMatrix(viewW: number, viewH: number, near: number, far: number): Float32Array
   /** Fires on state transitions only. Returns an unsubscribe function. */
   onStatus(cb: (s: TrackerStatus) => void): () => void
   stats(): TrackerStats
-  setOptions(o: Partial<Pick<TrackerOptions, 'hfovDeg' | 'detectWidth' | 'useImu'>>): void
+  /**
+   * Change options at runtime. Changing `useImu` resets tracking (fusion state is discarded), so
+   * do not use it mid-game.
+   */
+  setOptions(
+    o: Partial<
+      Pick<TrackerOptions, 'fovDeg' | 'hfovDeg' | 'detectWidth' | 'useImu' | 'captureLatencyMs'>
+    >,
+  ): void
 }
 
 export type TrackerStartError = Error & { code: TrackerError }
@@ -88,8 +155,14 @@ function screenAngle(): number {
   return s?.orientation?.angle ?? w.orientation ?? 0
 }
 
+/**
+ * requestVideoFrameCallback metadata. captureTime / expectedDisplayTime are DOMHighResTimeStamps
+ * on the performance.now() clock (HTML spec; Chrome: captureTime only for local camera/WebRTC
+ * frames; Safari/Firefox do not provide it, so those use the fallbacks). Not verified on device.
+ */
+type FrameMeta = { captureTime?: number; expectedDisplayTime?: number }
 type VideoWithRvfc = HTMLVideoElement & {
-  requestVideoFrameCallback?: (cb: () => void) => number
+  requestVideoFrameCallback?: (cb: (now: number, md: FrameMeta) => void) => number
   cancelVideoFrameCallback?: (h: number) => void
 }
 type Canvas2D = {
@@ -114,7 +187,8 @@ export function createTracker(opts: TrackerOptions): Tracker {
   const video = opts.video as VideoWithRvfc
   const markerSizeM = (opts.markerSizeMm ?? 50) / 1000
   const url = opts.url ?? DEFAULT_URL
-  let hfovDeg = opts.hfovDeg ?? 65
+  let fovDeg = opts.fovDeg ?? opts.hfovDeg ?? 65
+  let captureLatencyMs = opts.captureLatencyMs
   let detectWidth = opts.detectWidth ?? 640
   let useImu = opts.useImu ?? true
 
@@ -142,6 +216,13 @@ export function createTracker(opts: TrackerOptions): Tracker {
   let ctx: Canvas2D | null = null
   let ctxW = 0
   let ctxH = 0
+  let startP: Promise<void> | null = null
+  let reacquireP: Promise<void> | null = null
+  let loopPaused = false
+  let trackEnded = false
+  let listenersOn = false
+  let lastDisplayTime: number | null = null
+  let framePeriodMs = 33
 
   let lastDetectMs = 0
   let lastReproj = NaN
@@ -156,10 +237,11 @@ export function createTracker(opts: TrackerOptions): Tracker {
   const onOrientation = (e: Event): void => {
     const ev = e as DeviceOrientationEvent
     if (ev.alpha == null || ev.beta == null || ev.gamma == null) return
-    fusion.onImu(
-      performance.now(),
-      deviceOrientationToQuat(ev.alpha, ev.beta, ev.gamma, screenAngle()),
-    )
+    // Event.timeStamp is on the performance.now() clock in current browsers; guard against an
+    // epoch-based value (old Firefox/Safari) by falling back to now.
+    const ts =
+      Number.isFinite(ev.timeStamp) && ev.timeStamp < 1e11 ? ev.timeStamp : performance.now()
+    fusion.onImu(ts, deviceOrientationToQuat(ev.alpha, ev.beta, ev.gamma, screenAngle()))
   }
 
   const refreshStatus = (): void => {
@@ -210,7 +292,7 @@ export function createTracker(opts: TrackerOptions): Tracker {
     refreshStatus()
   }
 
-  const grab = (): void => {
+  const grab = (frameTime: number): void => {
     if (!worker) return
     if (!pump.canSend() || pool.length === 0) {
       pump.noteDropped()
@@ -234,7 +316,7 @@ export function createTracker(opts: TrackerOptions): Tracker {
       const data = c.getImageData(0, 0, dw, dh).data
       toGray(data, dw, dh, pb.img)
       sentId = nextId++
-      postFrame(pb, sentId, dw, dh)
+      postFrame(pb, sentId, dw, dh, frameTime)
     } catch (e) {
       lastError = e instanceof Error ? e.message : String(e)
       if (sentId !== null) pump.markDone(sentId)
@@ -246,27 +328,51 @@ export function createTracker(opts: TrackerOptions): Tracker {
     }
   }
 
-  const postFrame = (pb: PoolBuf, id: number, dw: number, dh: number): void => {
+  const postFrame = (pb: PoolBuf, id: number, dw: number, dh: number, frameTime: number): void => {
     if (!worker) return
     const msg: ToWorker = {
       type: 'frame',
       id,
-      timestamp: performance.now(),
+      timestamp: frameTime,
       width: dw,
       height: dh,
       gray: pb.buf,
-      K: intrinsicsFromSize(dw, dh, hfovDeg),
+      K: intrinsicsFromSize(dw, dh, fovDeg),
     }
     pump.markSent(id)
     worker.postMessage(msg, [pb.buf])
   }
 
+  /** Frame timestamp: captureTime, else expectedDisplayTime minus one frame, else now. */
+  const frameTimeOf = (md: FrameMeta | undefined): number => {
+    const ct = md?.captureTime
+    if (typeof ct === 'number' && Number.isFinite(ct)) return ct - (captureLatencyMs ?? 0)
+    const ed = md?.expectedDisplayTime
+    if (typeof ed === 'number' && Number.isFinite(ed)) {
+      if (lastDisplayTime !== null) {
+        const d = ed - lastDisplayTime
+        if (d >= 8 && d <= 100) framePeriodMs = d
+      }
+      lastDisplayTime = ed
+      return ed - framePeriodMs
+    }
+    return performance.now() - (captureLatencyMs ?? 40)
+  }
+
+  const cancelLoop = (): void => {
+    if (loopHandle !== null) {
+      if (loopIsRvfc) video.cancelVideoFrameCallback?.(loopHandle)
+      else if (typeof cancelAnimationFrame !== 'undefined') cancelAnimationFrame(loopHandle)
+      loopHandle = null
+    }
+  }
+
   const schedule = (): void => {
-    if (!running) return
-    const tick = (): void => {
-      if (!running) return
+    if (!running || loopPaused) return
+    const tick = (_now?: number, md?: FrameMeta): void => {
+      if (!running || loopPaused) return
       try {
-        grab()
+        grab(frameTimeOf(md))
         refreshStatus()
       } finally {
         schedule()
@@ -277,17 +383,129 @@ export function createTracker(opts: TrackerOptions): Tracker {
       loopHandle = video.requestVideoFrameCallback(tick)
     } else {
       loopIsRvfc = false
-      loopHandle = requestAnimationFrame(tick)
+      loopHandle = requestAnimationFrame(() => tick())
     }
+  }
+
+  const CAMERA_CONSTRAINTS: MediaStreamConstraints = {
+    video: {
+      facingMode: { ideal: 'environment' },
+      width: { ideal: 1280 },
+      height: { ideal: 720 },
+    },
+    audio: false,
+  }
+
+  const isHidden = (): boolean =>
+    typeof document !== 'undefined' && document.visibilityState === 'hidden'
+
+  const streamEnded = (): boolean =>
+    stream?.getTracks().some((t) => t.readyState === 'ended') ?? false
+
+  const watchTracks = (st: MediaStream | null, on: boolean): void => {
+    st?.getTracks().forEach((t) => {
+      if (on) t.addEventListener('ended', onTrackEnded)
+      else t.removeEventListener('ended', onTrackEnded)
+    })
+  }
+
+  const addLifecycleListeners = (): void => {
+    if (listenersOn) return
+    listenersOn = true
+    watchTracks(stream, true)
+    video.addEventListener('pause', onVideoPause)
+    if (typeof document !== 'undefined') document.addEventListener('visibilitychange', onVisibility)
+  }
+
+  function removeLifecycleListeners(): void {
+    if (!listenersOn) return
+    listenersOn = false
+    watchTracks(stream, false)
+    video.removeEventListener('pause', onVideoPause)
+    if (typeof document !== 'undefined')
+      document.removeEventListener('visibilitychange', onVisibility)
+  }
+
+  /** Re-acquire the camera, reusing the worker. Honours the generation token. */
+  const reacquire = (): Promise<void> => {
+    if (reacquireP) return reacquireP
+    const my = gen
+    loopPaused = true
+    cancelLoop()
+    const p: Promise<void> = (async () => {
+      try {
+        if (typeof navigator === 'undefined' || !navigator.mediaDevices?.getUserMedia)
+          throw fail('camera-interrupted', 'navigator.mediaDevices is not available')
+        const st = await navigator.mediaDevices.getUserMedia(CAMERA_CONSTRAINTS)
+        if (my !== gen) {
+          st.getTracks().forEach((t) => t.stop())
+          return
+        }
+        watchTracks(stream, false)
+        stream?.getTracks().forEach((t) => t.stop())
+        stream = st
+        watchTracks(st, true)
+        trackEnded = false
+        video.srcObject = st
+        await video.play()
+        if (my !== gen) return
+        loopPaused = false
+        schedule()
+      } catch (e) {
+        if (my !== gen) return
+        teardown()
+        setStatus({ state: 'error', reason: 'camera-interrupted' })
+        throw fail('camera-interrupted', e instanceof Error ? e.message : 'camera interrupted')
+      }
+    })()
+    const tracked = p.finally(() => {
+      if (reacquireP === tracked) reacquireP = null
+    })
+    reacquireP = tracked
+    return tracked
+  }
+
+  /** Resume after a pause, re-acquiring the camera when its track has ended. */
+  const recover = (): Promise<void> => {
+    if (!running) return Promise.resolve()
+    if (trackEnded || streamEnded()) return reacquire()
+    if (loopPaused && !reacquireP) {
+      loopPaused = false
+      schedule()
+    }
+    Promise.resolve(video.play()).catch(() => undefined)
+    return Promise.resolve()
+  }
+  const recoverQuiet = (): void => {
+    recover().catch(() => undefined) // failure is already reported through the status
+  }
+
+  function onTrackEnded(): void {
+    trackEnded = true
+    if (!running) return
+    loopPaused = true
+    cancelLoop()
+    if (!isHidden()) recoverQuiet()
+  }
+  function onVideoPause(): void {
+    if (!running || isHidden() || reacquireP || loopPaused) return
+    Promise.resolve(video.play()).catch(recoverQuiet)
+  }
+  function onVisibility(): void {
+    if (!running) return
+    if (isHidden()) {
+      loopPaused = true
+      cancelLoop()
+      return
+    }
+    recoverQuiet()
   }
 
   const teardown = (): void => {
     running = false
-    if (loopHandle !== null) {
-      if (loopIsRvfc) video.cancelVideoFrameCallback?.(loopHandle)
-      else if (typeof cancelAnimationFrame !== 'undefined') cancelAnimationFrame(loopHandle)
-      loopHandle = null
-    }
+    loopPaused = false
+    cancelLoop()
+    removeLifecycleListeners()
     if (typeof window !== 'undefined')
       window.removeEventListener('deviceorientation', onOrientation)
     imuActive = false
@@ -299,6 +517,8 @@ export function createTracker(opts: TrackerOptions): Tracker {
     }
     stream?.getTracks().forEach((t) => t.stop())
     stream = null
+    trackEnded = false
+    reacquireP = null
     if (video) video.srcObject = null
     pool = []
   }
@@ -311,14 +531,7 @@ export function createTracker(opts: TrackerOptions): Tracker {
 
     // Must be requested synchronously, inside the user gesture (iOS).
     const motionP = requestMotionPermission()
-    const gumP = navigator.mediaDevices.getUserMedia({
-      video: {
-        facingMode: { ideal: 'environment' },
-        width: { ideal: 1280 },
-        height: { ideal: 720 },
-      },
-      audio: false,
-    })
+    const gumP = navigator.mediaDevices.getUserMedia(CAMERA_CONSTRAINTS)
     // Attach early so a rejection during the motion prompt is never unhandled.
     const gumSettled = gumP.then(
       (st) => ({ ok: true as const, st }),
@@ -379,16 +592,18 @@ export function createTracker(opts: TrackerOptions): Tracker {
     }
 
     running = true
+    loopPaused = false
+    addLifecycleListeners()
     setStatus({ state: 'lost' })
     schedule()
   }
 
-  return {
-    async start() {
-      if (status.state === 'starting' || status.state === 'tracking' || status.state === 'lost')
-        return
-      const my = ++gen
-      setStatus({ state: 'starting' })
+  const start = (): Promise<void> => {
+    if (startP) return startP
+    if (status.state === 'tracking' || status.state === 'lost') return Promise.resolve()
+    const my = ++gen
+    setStatus({ state: 'starting' })
+    const p: Promise<void> = (async () => {
       try {
         await startImpl(my)
       } catch (e) {
@@ -400,9 +615,24 @@ export function createTracker(opts: TrackerOptions): Tracker {
           ? e
           : fail('unknown', e instanceof Error ? e.message : String(e))
       }
+    })()
+    const tracked = p.finally(() => {
+      if (startP === tracked) startP = null
+    })
+    startP = tracked
+    return tracked
+  }
+
+  return {
+    start,
+    restart() {
+      if (status.state === 'starting' && startP) return startP
+      if (running) return reacquire()
+      return start()
     },
     stop() {
       gen++
+      startP = null
       teardown()
       setStatus({ state: 'idle' })
     },
@@ -417,6 +647,8 @@ export function createTracker(opts: TrackerOptions): Tracker {
           quaternion: q,
           source: 'none',
           confidence: 0,
+          flat: true,
+          cameraYaw: 0,
         }
       }
       return {
@@ -425,11 +657,13 @@ export function createTracker(opts: TrackerOptions): Tracker {
         quaternion: f.quaternion,
         source: f.source,
         confidence: f.confidence,
+        flat: f.flat,
+        cameraYaw: cameraYawFromQuat(f.quaternion),
       }
     },
     projectionMatrix(viewW, viewH, near, far) {
       const { w, h } = videoSize()
-      return projectionForCover(intrinsicsFromSize(w, h, hfovDeg), viewW, viewH, near, far)
+      return projectionForCover(intrinsicsFromSize(w, h, fovDeg), viewW, viewH, near, far)
     },
     onStatus(cb) {
       listeners.add(cb)
@@ -450,7 +684,9 @@ export function createTracker(opts: TrackerOptions): Tracker {
       return out
     },
     setOptions(o) {
-      if (o.hfovDeg !== undefined) hfovDeg = o.hfovDeg
+      if (o.hfovDeg !== undefined) fovDeg = o.hfovDeg
+      if (o.fovDeg !== undefined) fovDeg = o.fovDeg
+      if (o.captureLatencyMs !== undefined) captureLatencyMs = o.captureLatencyMs
       if (o.detectWidth !== undefined) detectWidth = o.detectWidth
       if (o.useImu !== undefined && o.useImu !== useImu) {
         useImu = o.useImu

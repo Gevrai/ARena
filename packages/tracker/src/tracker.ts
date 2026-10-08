@@ -133,6 +133,7 @@ export function createTracker(opts: TrackerOptions): Tracker {
   let imuActive = false
   let motionGranted = false
   let running = false
+  let gen = 0
   let loopHandle: number | null = null
   let loopIsRvfc = false
   let nextId = 1
@@ -223,14 +224,30 @@ export function createTracker(opts: TrackerOptions): Tracker {
     const pb = pool.pop()
     if (!pb) return
     const n = dw * dh
-    if (pb.buf.byteLength !== n) {
-      pb.buf = new ArrayBuffer(n)
-      pb.img = makePoolBuf(pb.buf, dw, dh).img
+    let sentId: number | null = null
+    try {
+      if (pb.buf.byteLength !== n) {
+        pb.buf = new ArrayBuffer(n)
+        pb.img = makePoolBuf(pb.buf, dw, dh).img
+      }
+      c.drawImage(video, 0, 0, dw, dh)
+      const data = c.getImageData(0, 0, dw, dh).data
+      toGray(data, dw, dh, pb.img)
+      sentId = nextId++
+      postFrame(pb, sentId, dw, dh)
+    } catch (e) {
+      lastError = e instanceof Error ? e.message : String(e)
+      if (sentId !== null) pump.markDone(sentId)
+      if (pb.buf.byteLength === 0) {
+        pb.buf = new ArrayBuffer(n)
+        pb.img = makePoolBuf(pb.buf, dw, dh).img
+      }
+      pool.push(pb)
     }
-    c.drawImage(video, 0, 0, dw, dh)
-    const data = c.getImageData(0, 0, dw, dh).data
-    toGray(data, dw, dh, pb.img)
-    const id = nextId++
+  }
+
+  const postFrame = (pb: PoolBuf, id: number, dw: number, dh: number): void => {
+    if (!worker) return
     const msg: ToWorker = {
       type: 'frame',
       id,
@@ -248,9 +265,12 @@ export function createTracker(opts: TrackerOptions): Tracker {
     if (!running) return
     const tick = (): void => {
       if (!running) return
-      grab()
-      refreshStatus()
-      schedule()
+      try {
+        grab()
+        refreshStatus()
+      } finally {
+        schedule()
+      }
     }
     if (typeof video.requestVideoFrameCallback === 'function') {
       loopIsRvfc = true
@@ -283,7 +303,7 @@ export function createTracker(opts: TrackerOptions): Tracker {
     pool = []
   }
 
-  const startImpl = async (): Promise<void> => {
+  const startImpl = async (my: number): Promise<void> => {
     if (typeof isSecureContext !== 'undefined' && !isSecureContext)
       throw fail('insecure-context', 'Camera requires a secure context (https)')
     if (typeof navigator === 'undefined' || !navigator.mediaDevices?.getUserMedia)
@@ -299,14 +319,24 @@ export function createTracker(opts: TrackerOptions): Tracker {
       },
       audio: false,
     })
+    // Attach early so a rejection during the motion prompt is never unhandled.
+    const gumSettled = gumP.then(
+      (st) => ({ ok: true as const, st }),
+      (err: unknown) => ({ ok: false as const, err }),
+    )
     const motion = await motionP
-    motionGranted = motion === 'granted'
-    try {
-      stream = await gumP
-    } catch (e) {
-      const code = mapCameraError(e)
-      throw fail(code, e instanceof Error ? e.message : 'getUserMedia failed')
+    const got = await gumSettled
+    if (got.ok && my !== gen) {
+      got.st.getTracks().forEach((t) => t.stop())
+      return
     }
+    if (my !== gen) return
+    if (!got.ok) {
+      const code = mapCameraError(got.err)
+      throw fail(code, got.err instanceof Error ? got.err.message : 'getUserMedia failed')
+    }
+    motionGranted = motion === 'granted'
+    stream = got.st
 
     video.srcObject = stream
     video.setAttribute('playsinline', '')
@@ -314,8 +344,10 @@ export function createTracker(opts: TrackerOptions): Tracker {
     try {
       await video.play()
     } catch (e) {
+      if (my !== gen) return
       throw fail('unknown', e instanceof Error ? e.message : 'video.play() failed')
     }
+    if (my !== gen) return
 
     fusion = new PoseFusion({ useImu })
     pump = new FramePump()
@@ -335,6 +367,8 @@ export function createTracker(opts: TrackerOptions): Tracker {
     }
     worker.onerror = (e: ErrorEvent): void => {
       lastError = e.message || 'worker error'
+      teardown()
+      setStatus({ state: 'error', reason: 'unknown' })
     }
     const init: ToWorker = { type: 'init', markerSizeM, url }
     worker.postMessage(init)
@@ -353,10 +387,12 @@ export function createTracker(opts: TrackerOptions): Tracker {
     async start() {
       if (status.state === 'starting' || status.state === 'tracking' || status.state === 'lost')
         return
+      const my = ++gen
       setStatus({ state: 'starting' })
       try {
-        await startImpl()
+        await startImpl(my)
       } catch (e) {
+        if (my !== gen) return // stopped meanwhile
         teardown()
         const code = (e as { code?: TrackerError }).code ?? 'unknown'
         setStatus({ state: 'error', reason: code })
@@ -366,6 +402,7 @@ export function createTracker(opts: TrackerOptions): Tracker {
       }
     },
     stop() {
+      gen++
       teardown()
       setStatus({ state: 'idle' })
     },

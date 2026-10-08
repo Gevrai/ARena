@@ -279,6 +279,97 @@ describe('start() happy paths', () => {
   })
 })
 
+describe('robustness', () => {
+  it('a throw while grabbing does not kill the loop', async () => {
+    let calls = 0
+    vi.stubGlobal(
+      'OffscreenCanvas',
+      class {
+        width = 0
+        height = 0
+        getContext() {
+          return {
+            drawImage() {
+              if (calls++ === 0) throw new Error('draw failed')
+            },
+            getImageData: (_x: number, _y: number, w: number, h: number) => ({
+              data: new Uint8ClampedArray(w * h * 4),
+            }),
+          }
+        }
+      },
+    )
+    const { tracker, video } = mk({ useImu: false })
+    await tracker.start()
+    const w = FakeWorker.last!
+    expect(() => video.cb!()).not.toThrow()
+    expect(w.posted.filter((p) => p.msg.type === 'frame')).toHaveLength(0)
+    expect(tracker.stats().lastError).toBe('draw failed')
+    expect(video.cb).not.toBeNull()
+    video.cb!()
+    expect(w.posted.filter((p) => p.msg.type === 'frame')).toHaveLength(1)
+    tracker.stop()
+  })
+
+  it('worker error -> status error, worker terminated, loop stopped', async () => {
+    const { tracker, video } = mk({ useImu: false })
+    const seen: TrackerStatus[] = []
+    tracker.onStatus((s) => seen.push(s))
+    await tracker.start()
+    const w = FakeWorker.last!
+    video.cb!()
+    w.onerror!({ message: 'load failed' })
+    expect(seen.at(-1)).toEqual({ state: 'error', reason: 'unknown' })
+    expect(w.terminated).toBe(true)
+    expect(tracker.stats().lastError).toBe('load failed')
+    const n = w.posted.length
+    video.cb?.()
+    expect(w.posted.length).toBe(n)
+  })
+
+  it('stop() during start() leaves idle, no worker, tracks stopped', async () => {
+    let resolveGum!: (s: unknown) => void
+    const { stream, track } = makeStream()
+    vi.stubGlobal('navigator', {
+      mediaDevices: {
+        getUserMedia: vi.fn(() => new Promise((r) => (resolveGum = r))),
+      },
+    })
+    const { tracker } = mk()
+    const seen: string[] = []
+    tracker.onStatus((s) => seen.push(s.state))
+    const p = tracker.start()
+    tracker.stop()
+    resolveGum(stream)
+    await p
+    expect(FakeWorker.last).toBeNull()
+    expect(track.stop).toHaveBeenCalled()
+    expect(seen.at(-1)).toBe('idle')
+  })
+
+  it('getUserMedia rejection during motion prompt is not unhandled', async () => {
+    let resolveMotion!: (v: string) => void
+    vi.stubGlobal(
+      'DeviceOrientationEvent',
+      class {
+        static requestPermission = () => new Promise<string>((r) => (resolveMotion = r))
+      },
+    )
+    vi.stubGlobal('navigator', {
+      mediaDevices: {
+        getUserMedia: vi.fn(async () => {
+          throw Object.assign(new Error('x'), { name: 'NotAllowedError' })
+        }),
+      },
+    })
+    const { tracker } = mk()
+    const p = tracker.start()
+    await new Promise((r) => setTimeout(r, 5))
+    resolveMotion('granted')
+    await expect(p).rejects.toMatchObject({ code: 'camera-denied' })
+  })
+})
+
 describe('projectionForCover', () => {
   const project = (P: Float32Array, V: Float32Array, p: Vec3, W: number, H: number) => {
     const c = [p[0], p[1], p[2], 1]

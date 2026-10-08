@@ -153,6 +153,7 @@ describe('detectFramedQr', () => {
     if (process.env['BENCH'])
       process.stdout.write(`SWEEP detected ${detected}/${total}, wrong ${wrong}\n`)
     expect(wrong).toBe(0)
+    expect(detected).toBeGreaterThanOrEqual(Math.floor(total / 3))
   })
 
   // Card decoys: dark outer quad + lighter inner quad.

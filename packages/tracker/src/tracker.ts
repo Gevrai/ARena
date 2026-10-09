@@ -1,5 +1,6 @@
 import type { Detection } from './detect/framedQr'
 import { PoseFusion } from './fusion/fusion'
+import type { FusedPose } from './fusion/fusion'
 import { deviceOrientationToQuat, requestMotionPermission } from './imu/orientation'
 import { DEFAULT_URL } from './marker/layout'
 import { mat4FromRotationTranslation } from './math/mat4'
@@ -40,6 +41,27 @@ export interface TrackerOptions {
   useImu?: boolean
   /** URL encoded in the marker. Default DEFAULT_URL. */
   url?: string
+  /** Position smoothing 0..1 (0 = responsive, 1 = very smooth; speed-adaptive). Default 0.5. */
+  smoothing?: number
+  /**
+   * Latency compensation: extrapolate the marker position at constant velocity up to this many ms
+   * ahead of the last analysed frame (0 = off). Default 100.
+   */
+  predictMs?: number
+  /**
+   * Keep the last analysed frame (colour ImageData) with its exact pose for
+   * {@link Tracker.getSyncedFrame}. Costs one copy of the detect-sized frame. Default false.
+   */
+  keepFrames?: boolean
+}
+/** The last analysed camera frame and the pose that matches it exactly (no prediction). */
+export interface SyncedFrame {
+  /** Detect-resolution RGBA image (same aspect as the video, `detectWidth` wide). */
+  image: ImageData
+  /** Pose for this image: draw it over `image` instead of the live video. */
+  pose: TrackerPose
+  /** Capture timestamp (performance.now() clock), ms. */
+  timestamp: number
 }
 /**
  * Camera pose in the marker (world) frame.
@@ -88,6 +110,8 @@ export interface TrackerStats {
   reprojErrorPx: number
   imu: boolean
   corners: Detection['corners'] | null
+  /** Latest capture-to-result latency in ms (frame capture -> detection result received). */
+  latencyMs: number
   videoW: number
   videoH: number
   /** Last worker-reported error message, if any (extension to the original brief). */
@@ -118,13 +142,24 @@ export interface Tracker {
   /** Fires on state transitions only. Returns an unsubscribe function. */
   onStatus(cb: (s: TrackerStatus) => void): () => void
   stats(): TrackerStats
+  /** Last analysed frame + matching pose (needs `keepFrames`); null until a marker was seen. */
+  getSyncedFrame(): SyncedFrame | null
   /**
    * Change options at runtime. Changing `useImu` resets tracking (fusion state is discarded), so
    * do not use it mid-game.
    */
   setOptions(
     o: Partial<
-      Pick<TrackerOptions, 'fovDeg' | 'hfovDeg' | 'detectWidth' | 'useImu' | 'captureLatencyMs'>
+      Pick<TrackerOptions, 
+        | 'fovDeg'
+        | 'hfovDeg'
+        | 'detectWidth'
+        | 'useImu'
+        | 'captureLatencyMs'
+        | 'smoothing'
+        | 'predictMs'
+        | 'keepFrames'
+      >
     >,
   ): void
 }
@@ -167,7 +202,7 @@ type VideoWithRvfc = HTMLVideoElement & {
 }
 type Canvas2D = {
   drawImage(img: CanvasImageSource, x: number, y: number, w: number, h: number): void
-  getImageData(x: number, y: number, w: number, h: number): { data: Uint8ClampedArray }
+  getImageData(x: number, y: number, w: number, h: number): ImageData
 }
 type Surface = { width: number; height: number; getContext(t: '2d', o: object): unknown }
 
@@ -183,6 +218,31 @@ const makePoolBuf = (buf: ArrayBuffer, w: number, h: number): PoolBuf => ({
 const FALLBACK_VIDEO = { w: 1280, h: 720 }
 const POOL_SIZE = 2
 
+function fusedToPose(f: FusedPose): TrackerPose {
+  if (f.source === 'none') {
+    const q: Quat = [0, 0, 0, 1]
+    const p: Vec3 = [0, 0, 0]
+    return {
+      matrix: mat4FromRotationTranslation(q, p),
+      position: p,
+      quaternion: q,
+      source: 'none',
+      confidence: 0,
+      flat: true,
+      cameraYaw: 0,
+    }
+  }
+  return {
+    matrix: mat4FromRotationTranslation(f.quaternion, f.position),
+    position: f.position,
+    quaternion: f.quaternion,
+    source: f.source,
+    confidence: f.confidence,
+    flat: f.flat,
+    cameraYaw: cameraYawFromQuat(f.quaternion),
+  }
+}
+
 export function createTracker(opts: TrackerOptions): Tracker {
   const video = opts.video as VideoWithRvfc
   const markerSizeM = (opts.markerSizeMm ?? 50) / 1000
@@ -191,6 +251,16 @@ export function createTracker(opts: TrackerOptions): Tracker {
   let captureLatencyMs = opts.captureLatencyMs
   let detectWidth = opts.detectWidth ?? 640
   let useImu = opts.useImu ?? true
+  let smoothing = opts.smoothing ?? 0.5
+  let predictMs = opts.predictMs ?? 100
+  let keepFrames = opts.keepFrames ?? false
+  const fusionOpts = (): ConstructorParameters<typeof PoseFusion>[0] => ({
+    useImu,
+    smoothing,
+    predictMs,
+  })
+  const pendingFrames = new Map<number, ImageData>()
+  let synced: { image: ImageData; timestamp: number; pose: TrackerPose } | null = null
 
   let status: TrackerStatus = { state: 'idle' }
   const listeners = new Set<(s: TrackerStatus) => void>()
@@ -200,7 +270,7 @@ export function createTracker(opts: TrackerOptions): Tracker {
     for (const cb of [...listeners]) cb(next)
   }
 
-  let fusion = new PoseFusion({ useImu })
+  let fusion = new PoseFusion(fusionOpts())
   let pump = new FramePump()
   let worker: Worker | null = null
   let stream: MediaStream | null = null
@@ -225,6 +295,7 @@ export function createTracker(opts: TrackerOptions): Tracker {
   let framePeriodMs = 33
 
   let lastDetectMs = 0
+  let lastLatencyMs = 0
   let lastReproj = NaN
   let lastCorners: Detection['corners'] | null = null
   let lastError: string | undefined
@@ -272,6 +343,9 @@ export function createTracker(opts: TrackerOptions): Tracker {
       pool.push(makePoolBuf(r.gray, n, 1))
     }
     lastDetectMs = r.detectMs
+    lastLatencyMs = Math.max(0, now - r.timestamp)
+    const img = pendingFrames.get(r.id)
+    pendingFrames.delete(r.id)
     lastReproj = r.reprojErrorPx
     lastCorners = r.corners
     lastError = r.error
@@ -288,7 +362,20 @@ export function createTracker(opts: TrackerOptions): Tracker {
         },
         now,
       )
+      const sp = fusion.frameSyncedPose()
+      if (img && sp) {
+        const f = fusedToPose({
+          position: sp.position,
+          quaternion: sp.quaternion,
+          source: 'marker',
+          confidence: 1,
+          flat: true,
+        })
+        synced = { image: img, timestamp: r.timestamp, pose: f }
+      }
     }
+    // Drop frames whose results will never arrive (older than this one).
+    for (const k of pendingFrames.keys()) if (k < r.id) pendingFrames.delete(k)
     refreshStatus()
   }
 
@@ -313,9 +400,11 @@ export function createTracker(opts: TrackerOptions): Tracker {
         pb.img = makePoolBuf(pb.buf, dw, dh).img
       }
       c.drawImage(video, 0, 0, dw, dh)
-      const data = c.getImageData(0, 0, dw, dh).data
+      const imgData = c.getImageData(0, 0, dw, dh)
+      const data = imgData.data
       toGray(data, dw, dh, pb.img)
       sentId = nextId++
+      if (keepFrames) pendingFrames.set(sentId, imgData as ImageData)
       postFrame(pb, sentId, dw, dh, frameTime)
     } catch (e) {
       lastError = e instanceof Error ? e.message : String(e)
@@ -562,11 +651,13 @@ export function createTracker(opts: TrackerOptions): Tracker {
     }
     if (my !== gen) return
 
-    fusion = new PoseFusion({ useImu })
+    fusion = new PoseFusion(fusionOpts())
     pump = new FramePump()
     lastDetectMs = 0
     lastReproj = NaN
     lastCorners = null
+    synced = null
+    pendingFrames.clear()
     lastError = undefined
     nextId = 1
     const { w, h } = videoSize()
@@ -637,29 +728,10 @@ export function createTracker(opts: TrackerOptions): Tracker {
       setStatus({ state: 'idle' })
     },
     getPose() {
-      const f = fusion.get(performance.now())
-      if (f.source === 'none') {
-        const q: Quat = [0, 0, 0, 1]
-        const p: Vec3 = [0, 0, 0]
-        return {
-          matrix: mat4FromRotationTranslation(q, p),
-          position: p,
-          quaternion: q,
-          source: 'none',
-          confidence: 0,
-          flat: true,
-          cameraYaw: 0,
-        }
-      }
-      return {
-        matrix: mat4FromRotationTranslation(f.quaternion, f.position),
-        position: f.position,
-        quaternion: f.quaternion,
-        source: f.source,
-        confidence: f.confidence,
-        flat: f.flat,
-        cameraYaw: cameraYawFromQuat(f.quaternion),
-      }
+      return fusedToPose(fusion.get(performance.now()))
+    },
+    getSyncedFrame() {
+      return synced
     },
     projectionMatrix(viewW, viewH, near, far) {
       const { w, h } = videoSize()
@@ -677,6 +749,7 @@ export function createTracker(opts: TrackerOptions): Tracker {
         reprojErrorPx: lastReproj,
         imu: imuActive,
         corners: lastCorners,
+        latencyMs: lastLatencyMs,
         videoW: video.videoWidth > 0 ? w : 0,
         videoH: video.videoHeight > 0 ? h : 0,
       }
@@ -688,9 +761,24 @@ export function createTracker(opts: TrackerOptions): Tracker {
       if (o.fovDeg !== undefined) fovDeg = o.fovDeg
       if (o.captureLatencyMs !== undefined) captureLatencyMs = o.captureLatencyMs
       if (o.detectWidth !== undefined) detectWidth = o.detectWidth
+      if (o.smoothing !== undefined) {
+        smoothing = o.smoothing
+        fusion.setSmoothing(smoothing)
+      }
+      if (o.predictMs !== undefined) {
+        predictMs = o.predictMs
+        fusion.setPredictMs(predictMs)
+      }
+      if (o.keepFrames !== undefined) {
+        keepFrames = o.keepFrames
+        if (!keepFrames) {
+          pendingFrames.clear()
+          synced = null
+        }
+      }
       if (o.useImu !== undefined && o.useImu !== useImu) {
         useImu = o.useImu
-        fusion = new PoseFusion({ useImu })
+        fusion = new PoseFusion(fusionOpts())
         if (running && motionGranted) {
           window.removeEventListener('deviceorientation', onOrientation)
           if (useImu) window.addEventListener('deviceorientation', onOrientation)

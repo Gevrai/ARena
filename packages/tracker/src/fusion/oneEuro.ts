@@ -14,10 +14,16 @@ export class OneEuroFilter {
   private t = 0
 
   constructor(
-    private readonly minCutoff: number,
-    private readonly beta: number,
-    private readonly dCutoff = 1,
+    private minCutoff: number,
+    private beta: number,
+    private dCutoff = 1,
   ) {}
+
+  setParams(minCutoff: number, beta: number, dCutoff: number): void {
+    this.minCutoff = minCutoff
+    this.beta = beta
+    this.dCutoff = dCutoff
+  }
 
   filter(x: number, tSec: number): number {
     if (this.x === null) {
@@ -56,6 +62,9 @@ export class OneEuroVec3 {
       this.f[1].filter(v[1], tSec),
       this.f[2].filter(v[2], tSec),
     ]
+  }
+  setParams(minCutoff: number, beta: number, dCutoff: number): void {
+    for (const f of this.f) f.setParams(minCutoff, beta, dCutoff)
   }
   reset(): void {
     for (const f of this.f) f.reset()

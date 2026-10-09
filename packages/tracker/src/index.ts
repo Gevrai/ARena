@@ -18,6 +18,7 @@ export type {
   TrackerStatus,
   TrackerError,
   TrackerStats,
+  SyncedFrame,
 } from './tracker'
 export { intrinsicsFromSize, projectionForCover } from './pose/intrinsics'
 export type { Intrinsics } from './pose/intrinsics'

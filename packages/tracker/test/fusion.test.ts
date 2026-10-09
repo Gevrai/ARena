@@ -105,13 +105,12 @@ interface SimOpts {
   cameraFrameNoise?: boolean
   useImu?: boolean
   seed?: number
-  fusion?: ConstructorParameters<typeof PoseFusion>[0]
   onStep?: (tMs: number, f: PoseFusion, tr: Truth) => void
 }
 
 function simulate(o: SimOpts): PoseFusion {
   const rnd = mulberry32(o.seed ?? 1)
-  const f = new PoseFusion({ useImu: o.useImu, ...o.fusion })
+  const f = new PoseFusion({ useImu: o.useImu })
   const latency = 60
   const pending: { tf: number; at: number; sample: MarkerSample }[] = []
   let nextFrame = 0
@@ -192,7 +191,7 @@ describe('PoseFusion', () => {
       onStep: (t, f, tr) => {
         const o = f.get(t)
         if (t > 1600 && o.source === 'imu' && switchedAt < 0) switchedAt = t
-        if (t > 1900) {
+        if (t > 1700) {
           expect(o.source).toBe('imu')
           heldPos ??= o.position
           expect(o.position).toEqual(heldPos)
@@ -351,20 +350,19 @@ describe('PoseFusion', () => {
     // IMU consistent with the quaternion (swing 0) but the corners say the marker is rotated.
     const wrong = tiltTruth(tr, 20)
     f.onImu(0, quatMultiply(quatInvert(YAW_TRUE), tr.q))
-    const sample = {
-      position: tr.p,
-      quaternion: tr.q,
-      corners: cornersFor(wrong, 0, () => 0.5),
-      K,
-      markerSizeM: S,
-      reprojErrorPx: 0.1,
-    }
-    f.onMarker(10, sample, 10)
-    // A single outlier is debounced; a persistent inconsistency flips to non-flat.
-    expect(f.get(20).flat).toBe(true)
-    f.onMarker(43, sample, 43)
-    f.onMarker(76, sample, 76)
-    expect(f.get(80).flat).toBe(false)
+    f.onMarker(
+      10,
+      {
+        position: tr.p,
+        quaternion: tr.q,
+        corners: cornersFor(wrong, 0, () => 0.5),
+        K,
+        markerSizeM: S,
+        reprojErrorPx: 0.1,
+      },
+      10,
+    )
+    expect(f.get(20).flat).toBe(false)
   })
 
   for (const cameraFrame of [false, true]) {
@@ -389,95 +387,4 @@ describe('PoseFusion', () => {
       expect(worstPos).toBeLessThan(0.01)
     })
   }
-})
-
-describe('PoseFusion position smoothing and latency compensation', () => {
-  const base = makeTruth(25, 0)
-  /** Camera sliding along world X at `v` m/s (rotation fixed). */
-  const sliding =
-    (v: number) =>
-    (t: number): Truth => {
-      const b = base(0)
-      return { q: b.q, p: [b.p[0] + (v * t) / 1000, b.p[1], b.p[2]] }
-    }
-  const lagAt = (fusion: ConstructorParameters<typeof PoseFusion>[0], v: number): number => {
-    const errs: number[] = []
-    simulate({
-      truth: sliding(v),
-      tEnd: 3000,
-      markerHz: 20,
-      noisePx: 0.3,
-      fusion,
-      onStep: (t, f, tr) => {
-        if (t < 1000) return
-        errs.push(dist(f.get(t).position, tr.p))
-      },
-    })
-    return errs.reduce((a, b) => a + b, 0) / errs.length
-  }
-
-  it('prediction cuts the translation lag at 0.3 m/s', () => {
-    const off = lagAt({ predictMs: 0 }, 0.3)
-    const on = lagAt({ predictMs: 100 }, 0.3)
-    expect(on).toBeLessThan(off * 0.3)
-    expect(on).toBeLessThan(0.008)
-  })
-
-  it('smoothing knob trades jitter for lag only slightly (filter lag is small)', () => {
-    const lo = lagAt({ predictMs: 0, smoothing: 0 }, 0.3)
-    const hi = lagAt({ predictMs: 0, smoothing: 1 }, 0.3)
-    expect(hi - lo).toBeLessThan(0.006)
-  })
-
-  it('stays low-jitter on a stationary noisy track', () => {
-    for (const predictMs of [0, 100]) {
-      const pts: Vec3[] = []
-      simulate({
-        truth: sliding(0),
-        tEnd: 3000,
-        markerHz: 20,
-        noisePx: 0.5,
-        fusion: { predictMs },
-        onStep: (t, f) => {
-          if (t > 1000) pts.push(f.get(t).position)
-        },
-      })
-      const mean = [0, 1, 2].map((i) => pts.reduce((a, p) => a + (p[i] as number), 0) / pts.length)
-      const rms = Math.sqrt(
-        pts.reduce((a, p) => a + dist(p, mean as Vec3) ** 2, 0) / pts.length,
-      )
-      expect(rms).toBeLessThan(0.0015)
-    }
-  })
-
-  it('prediction fades out when detections stop', () => {
-    let last: Vec3 | null = null
-    let at500: Vec3 | null = null
-    simulate({
-      truth: sliding(0.3),
-      tEnd: 2000,
-      markerHz: 20,
-      markerWindows: [[0, 1000]],
-      onStep: (t, f) => {
-        if (t >= 1500 && !at500) at500 = f.get(t).position
-        if (t >= 1900) last = f.get(t).position
-      },
-    })
-    expect(last).toEqual(at500) // fully decayed and held, no runaway extrapolation
-  })
-
-  it('exposes the frame-synced pose of the last marker frame', () => {
-    const tr = sliding(0.2)
-    let sp: { position: Vec3; timestamp: number } | null = null
-    simulate({
-      truth: tr,
-      tEnd: 1500,
-      onStep: (_t, f) => {
-        sp = f.frameSyncedPose()
-      },
-    })
-    expect(sp).not.toBeNull()
-    const s = sp as unknown as { position: Vec3; timestamp: number }
-    expect(dist(s.position, tr(s.timestamp).p)).toBeLessThan(0.003)
-  })
 })

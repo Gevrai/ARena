@@ -20,3 +20,5 @@
 - 2026-10-07: spec approved; AR tracker first; repo Gevrai/ARena; Pages URL https://gevrai.github.io/ARena/
 - Client devices: Android (primary), iPhone 6s / iOS 15 (secondary)
 - 2026-10-07: gravity-locked tracking (marker assumed flat on table)
+
+- Tracker latency: position filter retuned, constant-velocity prediction (`predictMs`, default 100), `smoothing` knob, `keepFrames`/`getSyncedFrame()`, demo controls (Smoothing / Predict / Sync video) and capture->result latency readout. Awaiting phone A/B.

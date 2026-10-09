@@ -8,6 +8,7 @@ body {
   font-family: ui-monospace, Menlo, Consolas, monospace;
 }
 #video,
+#synced,
 #gl,
 #overlay {
   position: fixed;
@@ -16,8 +17,12 @@ body {
   height: 100vh;
   height: 100dvh;
 }
-#video {
+#video,
+#synced {
   object-fit: cover;
+}
+#synced[hidden] {
+  display: none;
 }
 #overlay {
   pointer-events: none;

@@ -7,6 +7,7 @@
   </head>
   <body>
     <video id="video" playsinline muted autoplay></video>
+    <canvas id="synced" hidden></canvas>
     <canvas id="gl"></canvas>
     <canvas id="overlay"></canvas>
 
@@ -28,6 +29,12 @@
           >FOV (long side) <span id="hfov-val"></span>&deg;
           <input type="range" id="opt-hfov" min="50" max="80" step="1" />
         </label>
+        <label
+          >Smoothing <span id="smooth-val"></span>
+          <input type="range" id="opt-smooth" min="0" max="1" step="0.05" />
+        </label>
+        <label><input type="checkbox" id="opt-predict" /> Predict (latency comp.)</label>
+        <label><input type="checkbox" id="opt-sync" /> Sync video (delayed image)</label>
         <label><input type="checkbox" id="opt-corners" /> Show corners</label>
         <a href="../marker/">marker page</a>
       </div>

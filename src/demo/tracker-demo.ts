@@ -37,6 +37,11 @@ const optGyro = byId<HTMLInputElement>('opt-gyro')
 const optRes = byId<HTMLSelectElement>('opt-res')
 const optHfov = byId<HTMLInputElement>('opt-hfov')
 const hfovVal = byId('hfov-val')
+const syncedCanvas = byId<HTMLCanvasElement>('synced')
+const optSmooth = byId<HTMLInputElement>('opt-smooth')
+const smoothVal = byId('smooth-val')
+const optPredict = byId<HTMLInputElement>('opt-predict')
+const optSync = byId<HTMLInputElement>('opt-sync')
 const optCorners = byId<HTMLInputElement>('opt-corners')
 
 // ---- settings (localStorage, best effort) ----
@@ -45,6 +50,9 @@ interface Settings {
   detectWidth: number
   fov: number
   corners: boolean
+  smoothing: number
+  predict: boolean
+  sync: boolean
   hudCollapsed: boolean
 }
 const KEY = 'arena-tracker-demo'
@@ -53,6 +61,9 @@ const defaults: Settings = {
   detectWidth: 640,
   fov: 65,
   corners: false,
+  smoothing: 0.5,
+  predict: true,
+  sync: false,
   hudCollapsed: false,
 }
 function loadSettings(): Settings {
@@ -68,6 +79,9 @@ function loadSettings(): Settings {
           : defaults.detectWidth,
         fov: Math.min(80, Math.max(50, Number(p.fov ?? p.hfov) || defaults.fov)),
         corners: typeof p.corners === 'boolean' ? p.corners : defaults.corners,
+        smoothing: Math.min(1, Math.max(0, Number(p.smoothing ?? defaults.smoothing))),
+        predict: typeof p.predict === 'boolean' ? p.predict : defaults.predict,
+        sync: p.sync === true,
         hudCollapsed: p.hudCollapsed === true,
       }
     }
@@ -91,6 +105,9 @@ const tracker = createTracker({
   fovDeg: settings.fov,
   detectWidth: settings.detectWidth,
   useImu: settings.gyro,
+  smoothing: settings.smoothing,
+  predictMs: settings.predict ? 100 : 0,
+  keepFrames: settings.sync,
 })
 
 // ---- three.js scene ----
@@ -137,12 +154,25 @@ window.addEventListener('resize', resize)
 window.addEventListener('orientationchange', resize)
 resize()
 
+// ---- sync video: show the analysed frame (late) with its exact pose ----
+let syncedStamp = -1
+function applySync(): void {
+  syncedCanvas.hidden = !settings.sync
+  video.style.visibility = settings.sync ? 'hidden' : 'visible'
+  syncedStamp = -1
+}
+
 // ---- HUD ----
 optGyro.checked = settings.gyro
 optRes.value = String(settings.detectWidth)
 optHfov.value = String(settings.fov)
 hfovVal.textContent = String(settings.fov)
 optCorners.checked = settings.corners
+optSmooth.value = String(settings.smoothing)
+smoothVal.textContent = settings.smoothing.toFixed(2)
+optPredict.checked = settings.predict
+optSync.checked = settings.sync
+applySync()
 hud.classList.toggle('collapsed', settings.hudCollapsed)
 
 byId('hud-toggle').addEventListener('click', () => {
@@ -163,6 +193,23 @@ optHfov.addEventListener('input', () => {
   settings.fov = Number(optHfov.value)
   hfovVal.textContent = String(settings.fov)
   tracker.setOptions({ fovDeg: settings.fov })
+  saveSettings()
+})
+optSmooth.addEventListener('input', () => {
+  settings.smoothing = Number(optSmooth.value)
+  smoothVal.textContent = settings.smoothing.toFixed(2)
+  tracker.setOptions({ smoothing: settings.smoothing })
+  saveSettings()
+})
+optPredict.addEventListener('change', () => {
+  settings.predict = optPredict.checked
+  tracker.setOptions({ predictMs: settings.predict ? 100 : 0 })
+  saveSettings()
+})
+optSync.addEventListener('change', () => {
+  settings.sync = optSync.checked
+  tracker.setOptions({ keepFrames: settings.sync })
+  applySync()
   saveSettings()
 })
 optCorners.addEventListener('change', () => {
@@ -245,7 +292,24 @@ function drawCorners(): void {
 
 function frame(now: number): void {
   requestAnimationFrame(frame)
-  const pose = tracker.getPose()
+  let pose = tracker.getPose()
+  let showSynced = false
+  if (settings.sync) {
+    const sf = tracker.getSyncedFrame()
+    if (sf && pose.source !== 'none') {
+      pose = sf.pose
+      showSynced = true
+      if (sf.timestamp !== syncedStamp) {
+        syncedStamp = sf.timestamp
+        syncedCanvas.width = sf.image.width
+        syncedCanvas.height = sf.image.height
+        syncedCanvas.getContext('2d')?.putImageData(sf.image, 0, 0)
+      }
+    }
+  }
+  // Without a marker there is no matching frame: fall back to the live video.
+  syncedCanvas.hidden = !showSynced
+  video.style.visibility = showSynced ? 'hidden' : 'visible'
   const visible = pose.source !== 'none'
   content.visible = visible
   if (visible) {
@@ -267,6 +331,7 @@ function frame(now: number): void {
     const lines = [
       `detect  ${st.detectHz.toFixed(1)} Hz`,
       `detect  ${st.detectMs.toFixed(1)} ms`,
+      `latency ${st.latencyMs.toFixed(0)} ms (capture->result)`,
       `reproj  ${Number.isFinite(st.reprojErrorPx) ? st.reprojErrorPx.toFixed(2) : '-'} px`,
       `imu     ${st.imu ? 'on' : 'off'}`,
       `video   ${st.videoW}x${st.videoH}`,

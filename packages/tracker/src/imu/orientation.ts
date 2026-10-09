@@ -50,3 +50,16 @@ export async function requestMotionPermission(): Promise<'granted' | 'denied' | 
     return 'denied'
   }
 }
+
+/** iOS requires a user-gesture permission request for DeviceMotion (accelerometer) events too. */
+export async function requestAccelPermission(): Promise<'granted' | 'denied' | 'unsupported'> {
+  if (typeof window === 'undefined' || typeof DeviceMotionEvent === 'undefined')
+    return 'unsupported'
+  const api = DeviceMotionEvent as unknown as PermissionApi
+  if (typeof api.requestPermission !== 'function') return 'granted'
+  try {
+    return (await api.requestPermission()) === 'granted' ? 'granted' : 'denied'
+  } catch {
+    return 'denied'
+  }
+}

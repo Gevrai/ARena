@@ -1,6 +1,11 @@
 import type { Detection } from './detect/framedQr'
 import { PoseFusion } from './fusion/fusion'
-import { deviceOrientationToQuat, requestMotionPermission } from './imu/orientation'
+import { gravityFreeToCamera, deviceAccelToCamera } from './fusion/accel'
+import {
+  deviceOrientationToQuat,
+  requestAccelPermission,
+  requestMotionPermission,
+} from './imu/orientation'
 import { DEFAULT_URL } from './marker/layout'
 import { mat4FromRotationTranslation } from './math/mat4'
 import { cameraYawFromQuat } from './math/quat'
@@ -40,6 +45,11 @@ export interface TrackerOptions {
   useImu?: boolean
   /** URL encoded in the marker. Default DEFAULT_URL. */
   url?: string
+  /**
+   * Experimental: dead-reckon camera translation from the accelerometer between marker detections
+   * (and while the marker is lost). Default false; when false behaviour is unchanged.
+   */
+  useAccel?: boolean
 }
 /**
  * Camera pose in the marker (world) frame.
@@ -100,6 +110,12 @@ export interface TrackerStats {
   videoH: number
   /** Last worker-reported error message, if any (extension to the original brief). */
   lastError?: string
+  /** Only when useAccel is on: accelerometer sample rate (Hz). */
+  accelHz?: number
+  /** Only when useAccel is on: magnitude of the integrated displacement since the last detection (mm). */
+  accelDispMm?: number
+  /** Only when useAccel is on: latest gravity-free acceleration in the world frame (m/s^2). */
+  accelWorld?: Vec3
 }
 /**
  * AR marker tracker. World frame: origin at the marker centre, +Y up, +X to the card's right,
@@ -132,7 +148,10 @@ export interface Tracker {
    */
   setOptions(
     o: Partial<
-      Pick<TrackerOptions, 'fovDeg' | 'hfovDeg' | 'detectWidth' | 'useImu' | 'captureLatencyMs'>
+      Pick<
+        TrackerOptions,
+        'fovDeg' | 'hfovDeg' | 'detectWidth' | 'useImu' | 'captureLatencyMs' | 'useAccel'
+      >
     >,
   ): void
 }
@@ -199,6 +218,7 @@ export function createTracker(opts: TrackerOptions): Tracker {
   let captureLatencyMs = opts.captureLatencyMs
   let detectWidth = opts.detectWidth ?? 640
   let useImu = opts.useImu ?? true
+  let useAccel = opts.useAccel ?? false
 
   let status: TrackerStatus = { state: 'idle' }
   const listeners = new Set<(s: TrackerStatus) => void>()
@@ -208,11 +228,14 @@ export function createTracker(opts: TrackerOptions): Tracker {
     for (const cb of [...listeners]) cb(next)
   }
 
-  let fusion = new PoseFusion({ useImu })
+  let fusion = new PoseFusion({ useImu, useAccel })
   let pump = new FramePump()
   let worker: Worker | null = null
   let stream: MediaStream | null = null
   let imuActive = false
+  let accelActive = false
+  let latestImuQ: Quat | null = null
+  const accelTimes: number[] = []
   let motionGranted = false
   let running = false
   let gen = 0
@@ -251,7 +274,38 @@ export function createTracker(opts: TrackerOptions): Tracker {
     // epoch-based value (old Firefox/Safari) by falling back to now.
     const ts =
       Number.isFinite(ev.timeStamp) && ev.timeStamp < 1e11 ? ev.timeStamp : performance.now()
-    fusion.onImu(ts, deviceOrientationToQuat(ev.alpha, ev.beta, ev.gamma, screenAngle()))
+    const q = deviceOrientationToQuat(ev.alpha, ev.beta, ev.gamma, screenAngle())
+    if (useAccel) latestImuQ = q
+    fusion.onImu(ts, q)
+  }
+
+  const onMotion = (e: Event): void => {
+    const ev = e as DeviceMotionEvent
+    const ts =
+      Number.isFinite(ev.timeStamp) && ev.timeStamp < 1e11 ? ev.timeStamp : performance.now()
+    const lin = ev.acceleration
+    let a: Vec3 | null = null
+    if (lin && lin.x != null && lin.y != null && lin.z != null) {
+      a = deviceAccelToCamera([lin.x, lin.y, lin.z], screenAngle())
+    } else {
+      const g = ev.accelerationIncludingGravity
+      if (g && g.x != null && g.y != null && g.z != null && latestImuQ)
+        a = gravityFreeToCamera([g.x, g.y, g.z], latestImuQ, screenAngle())
+    }
+    if (!a) return
+    accelTimes.push(ts)
+    while (accelTimes.length > 0 && ts - (accelTimes[0] as number) > 1000) accelTimes.shift()
+    fusion.onAccel(ts, a)
+  }
+
+  const setAccelListener = (on: boolean): void => {
+    if (typeof window === 'undefined') return
+    window.removeEventListener('devicemotion', onMotion)
+    accelActive = false
+    if (on) {
+      window.addEventListener('devicemotion', onMotion)
+      accelActive = true
+    }
   }
 
   const refreshStatus = (): void => {
@@ -527,6 +581,7 @@ export function createTracker(opts: TrackerOptions): Tracker {
     removeLifecycleListeners()
     if (typeof window !== 'undefined')
       window.removeEventListener('deviceorientation', onOrientation)
+    if (accelActive) setAccelListener(false)
     imuActive = false
     if (worker) {
       worker.onmessage = null
@@ -550,6 +605,7 @@ export function createTracker(opts: TrackerOptions): Tracker {
 
     // Must be requested synchronously, inside the user gesture (iOS).
     const motionP = requestMotionPermission()
+    const accelP = useAccel ? requestAccelPermission() : null
     const gumP = navigator.mediaDevices.getUserMedia(CAMERA_CONSTRAINTS)
     // Attach early so a rejection during the motion prompt is never unhandled.
     const gumSettled = gumP.then(
@@ -557,6 +613,7 @@ export function createTracker(opts: TrackerOptions): Tracker {
       (err: unknown) => ({ ok: false as const, err }),
     )
     const motion = await motionP
+    const accelPerm = accelP ? await accelP : null
     const got = await gumSettled
     if (got.ok && my !== gen) {
       got.st.getTracks().forEach((t) => t.stop())
@@ -581,7 +638,7 @@ export function createTracker(opts: TrackerOptions): Tracker {
     }
     if (my !== gen) return
 
-    fusion = new PoseFusion({ useImu })
+    fusion = new PoseFusion({ useImu, useAccel })
     pump = new FramePump()
     lastDetectMs = 0
     lastLatencyMs = 0
@@ -611,6 +668,7 @@ export function createTracker(opts: TrackerOptions): Tracker {
       window.addEventListener('deviceorientation', onOrientation)
       imuActive = true
     }
+    if (useAccel && useImu && accelPerm === 'granted') setAccelListener(true)
 
     running = true
     loopPaused = false
@@ -695,7 +753,9 @@ export function createTracker(opts: TrackerOptions): Tracker {
       const now = performance.now()
       const last2 = frameLog.filter((f) => now - f.t <= 2000)
       const out: TrackerStats = {
-        hitRate2s: last2.length ? last2.filter((f) => f.outcome !== 'miss').length / last2.length : NaN,
+        hitRate2s: last2.length
+          ? last2.filter((f) => f.outcome !== 'miss').length / last2.length
+          : NaN,
         recent: frameLog.filter((f) => now - f.t <= 3000),
         latencyMs: lastLatencyMs,
         detectHz: pump.stats().detectHz,
@@ -707,6 +767,13 @@ export function createTracker(opts: TrackerOptions): Tracker {
         videoH: video.videoHeight > 0 ? h : 0,
       }
       if (lastError !== undefined) out.lastError = lastError
+      if (useAccel) {
+        const info = fusion.accelInfo(now)
+        const win = accelTimes.filter((t) => now - t <= 1000)
+        out.accelHz = win.length
+        out.accelDispMm = info ? Math.hypot(info.disp[0], info.disp[1], info.disp[2]) * 1000 : 0
+        out.accelWorld = info ? info.world : [0, 0, 0]
+      }
       return out
     },
     setOptions(o) {
@@ -714,9 +781,20 @@ export function createTracker(opts: TrackerOptions): Tracker {
       if (o.fovDeg !== undefined) fovDeg = o.fovDeg
       if (o.captureLatencyMs !== undefined) captureLatencyMs = o.captureLatencyMs
       if (o.detectWidth !== undefined) detectWidth = o.detectWidth
+      if (o.useAccel !== undefined && o.useAccel !== useAccel) {
+        useAccel = o.useAccel
+        accelTimes.length = 0
+        fusion = new PoseFusion({ useImu, useAccel })
+        if (running && useAccel && useImu) {
+          // Called from a UI event handler: the iOS permission prompt needs the gesture.
+          void requestAccelPermission().then((p) => {
+            if (running && useAccel && p === 'granted') setAccelListener(true)
+          })
+        } else setAccelListener(false)
+      }
       if (o.useImu !== undefined && o.useImu !== useImu) {
         useImu = o.useImu
-        fusion = new PoseFusion({ useImu })
+        fusion = new PoseFusion({ useImu, useAccel })
         if (running && motionGranted) {
           window.removeEventListener('deviceorientation', onOrientation)
           if (useImu) window.addEventListener('deviceorientation', onOrientation)

@@ -9,6 +9,7 @@ import {
   solveTranslationGivenRotation,
   worldFromCameraQuatToCvR,
 } from '../pose/pose'
+import { AccelTranslator } from './accel'
 import { OneEuroQuat, OneEuroVec3 } from './oneEuro'
 
 export interface FusedPose {
@@ -66,6 +67,8 @@ export class PoseFusion {
   private readonly blendMs: number
   private readonly rate: number
   private readonly useImu: boolean
+  private readonly useAccel: boolean
+  private readonly accel = new AccelTranslator()
   private readonly imu = new ImuHistory(120)
 
   private offset: Quat | null = null
@@ -87,12 +90,39 @@ export class PoseFusion {
       reacquireBlendMs?: number
       correctionRate?: number
       useImu?: boolean
+      /** Opt-in accelerometer dead-reckoning of translation (default false). */
+      useAccel?: boolean
     } = {},
   ) {
     this.lostAfterMs = opts.lostAfterMs ?? 150
     this.blendMs = opts.reacquireBlendMs ?? 200
     this.rate = opts.correctionRate ?? 4
     this.useImu = opts.useImu ?? true
+    this.useAccel = opts.useAccel ?? false
+  }
+
+  /** World-from-camera rotation at time t (marker yaw offset composed with the IMU). */
+  private readonly worldRot = (t: number): Quat | null => {
+    const q = this.imu.at(t)
+    return q && this.offset ? quatMultiply(this.offset, q) : null
+  }
+
+  /** Camera-frame acceleration (m/s^2, gravity removed) at time t. No-op unless useAccel. */
+  onAccel(t: number, aCam: Vec3): void {
+    if (this.useAccel) this.accel.push(t, aCam)
+  }
+
+  /** Output position: accelerometer-extrapolated when enabled and anchored, else the filtered one. */
+  private outPosition(now: number): Vec3 {
+    if (!this.useAccel || !this.offset) return this.position
+    return this.accel.position(now, this.worldRot) ?? this.position
+  }
+
+  /** Integrated displacement (m, world) and latest world acceleration, for diagnostics. */
+  accelInfo(now: number): { disp: Vec3; world: Vec3 } | null {
+    if (!this.useAccel) return null
+    const disp = this.accel.displacement(now, this.worldRot)
+    return { disp, world: this.accel.latestWorld(this.worldRot) }
   }
 
   onImu(t: number, q: Quat): void {
@@ -128,6 +158,7 @@ export class PoseFusion {
       // Marker-only mode.
       this.markerQuat = this.rotFilter.filter(m.quaternion, tSec)
       this.position = this.posFilter.filter(m.position, tSec)
+      if (this.useAccel) this.accel.clearAnchor()
       return
     }
 
@@ -145,6 +176,7 @@ export class PoseFusion {
       this.lastConfidence *= NOT_FLAT_CONFIDENCE
       this.markerQuat = this.rotFilter.filter(m.quaternion, tSec)
       this.position = this.posFilter.filter(m.position, tSec)
+      if (this.useAccel) this.accel.clearAnchor()
       return
     }
     this.flat = true
@@ -169,6 +201,10 @@ export class PoseFusion {
       ? poseToWorldFromCamera({ R: Rf, t: solF.t, reprojErrorPx: 0 }).position
       : m.position
     this.position = this.posFilter.filter(pos, tSec)
+    if (this.useAccel) {
+      this.accel.noteMarker(frameTime, pos)
+      this.accel.setAnchor(frameTime, this.position, this.lastArrivalT ?? frameTime, this.worldRot)
+    }
   }
 
   get(now: number): FusedPose {
@@ -176,12 +212,13 @@ export class PoseFusion {
     const age = this.lastArrivalT === null ? Infinity : now - this.lastArrivalT
     const fresh = age <= this.lostAfterMs
     const imuLive = this.useImu && latest !== null && now - latest.t < IMU_LIVE_MS
+    const position = this.outPosition(now)
 
     if (this.useImu && latest && this.offset) {
       const q = quatNormalize(quatMultiply(this.displayedOffset(now), latest.q))
       if (fresh && !this.flat)
         return {
-          position: this.position,
+          position,
           quaternion: this.markerQuat,
           source: 'marker',
           confidence: this.lastConfidence,
@@ -189,7 +226,7 @@ export class PoseFusion {
         }
       if (fresh)
         return {
-          position: this.position,
+          position,
           quaternion: q,
           source: 'marker',
           confidence: this.lastConfidence,
@@ -198,7 +235,7 @@ export class PoseFusion {
       if (imuLive) {
         const conf = 0.5 * this.lastConfidence * Math.exp(-age / 3000)
         return {
-          position: this.position,
+          position,
           quaternion: q,
           source: 'imu',
           confidence: conf,
@@ -206,7 +243,7 @@ export class PoseFusion {
         }
       }
       return {
-        position: this.position,
+        position,
         quaternion: q,
         source: 'none',
         confidence: 0,
@@ -215,7 +252,7 @@ export class PoseFusion {
     }
     if (this.useImu && latest && this.lastMarkerT === null) {
       return {
-        position: this.position,
+        position,
         quaternion: latest.q,
         source: 'none',
         confidence: 0,
@@ -225,7 +262,7 @@ export class PoseFusion {
     // Marker-only.
     if (this.lastMarkerT === null) {
       return {
-        position: this.position,
+        position,
         quaternion: IDENTITY,
         source: 'none',
         confidence: 0,
@@ -233,7 +270,7 @@ export class PoseFusion {
       }
     }
     return {
-      position: this.position,
+      position,
       quaternion: this.markerQuat,
       source: fresh ? 'marker' : 'none',
       confidence: fresh ? this.lastConfidence : 0,

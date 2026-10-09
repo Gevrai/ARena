@@ -17,12 +17,14 @@ export class OneEuroFilter {
     private minCutoff: number,
     private beta: number,
     private dCutoff = 1,
+    private deadband = 0,
   ) {}
 
-  setParams(minCutoff: number, beta: number, dCutoff: number): void {
+  setParams(minCutoff: number, beta: number, dCutoff: number, deadband = 0): void {
     this.minCutoff = minCutoff
     this.beta = beta
     this.dCutoff = dCutoff
+    this.deadband = deadband
   }
 
   filter(x: number, tSec: number): number {
@@ -36,7 +38,8 @@ export class OneEuroFilter {
     this.t = tSec
     const rawD = (x - this.x) / dt
     this.dx += alphaFor(this.dCutoff, dt) * (rawD - this.dx)
-    const cutoff = this.minCutoff + this.beta * Math.abs(this.dx)
+    // Speeds below `deadband` are treated as noise: they must not open the filter.
+    const cutoff = this.minCutoff + this.beta * Math.max(0, Math.abs(this.dx) - this.deadband)
     this.x += alphaFor(cutoff, dt) * (x - this.x)
     return this.x
   }
@@ -49,11 +52,11 @@ export class OneEuroFilter {
 
 export class OneEuroVec3 {
   private readonly f: [OneEuroFilter, OneEuroFilter, OneEuroFilter]
-  constructor(minCutoff: number, beta: number, dCutoff = 1) {
+  constructor(minCutoff: number, beta: number, dCutoff = 1, deadband = 0) {
     this.f = [
-      new OneEuroFilter(minCutoff, beta, dCutoff),
-      new OneEuroFilter(minCutoff, beta, dCutoff),
-      new OneEuroFilter(minCutoff, beta, dCutoff),
+      new OneEuroFilter(minCutoff, beta, dCutoff, deadband),
+      new OneEuroFilter(minCutoff, beta, dCutoff, deadband),
+      new OneEuroFilter(minCutoff, beta, dCutoff, deadband),
     ]
   }
   filter(v: Vec3, tSec: number): Vec3 {
@@ -63,8 +66,8 @@ export class OneEuroVec3 {
       this.f[2].filter(v[2], tSec),
     ]
   }
-  setParams(minCutoff: number, beta: number, dCutoff: number): void {
-    for (const f of this.f) f.setParams(minCutoff, beta, dCutoff)
+  setParams(minCutoff: number, beta: number, dCutoff: number, deadband = 0): void {
+    for (const f of this.f) f.setParams(minCutoff, beta, dCutoff, deadband)
   }
   reset(): void {
     for (const f of this.f) f.reset()
@@ -78,10 +81,18 @@ export class OneEuroQuat {
   private t = 0
 
   constructor(
-    private readonly minCutoff: number,
-    private readonly beta: number,
-    private readonly dCutoff = 1,
+    private minCutoff: number,
+    private beta: number,
+    private dCutoff = 1,
+    private deadband = 0,
   ) {}
+
+  setParams(minCutoff: number, beta: number, dCutoff: number, deadband = 0): void {
+    this.minCutoff = minCutoff
+    this.beta = beta
+    this.dCutoff = dCutoff
+    this.deadband = deadband
+  }
 
   filter(q: Quat, tSec: number): Quat {
     if (this.q === null) {
@@ -93,7 +104,7 @@ export class OneEuroQuat {
     this.t = tSec
     const raw = quatAngle(this.q, q) / dt
     this.speed += alphaFor(this.dCutoff, dt) * (raw - this.speed)
-    this.q = quatSlerp(this.q, q, alphaFor(this.minCutoff + this.beta * this.speed, dt))
+    this.q = quatSlerp(this.q, q, alphaFor(this.minCutoff + this.beta * Math.max(0, this.speed - this.deadband), dt))
     return this.q
   }
 

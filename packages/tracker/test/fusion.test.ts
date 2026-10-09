@@ -351,19 +351,20 @@ describe('PoseFusion', () => {
     // IMU consistent with the quaternion (swing 0) but the corners say the marker is rotated.
     const wrong = tiltTruth(tr, 20)
     f.onImu(0, quatMultiply(quatInvert(YAW_TRUE), tr.q))
-    f.onMarker(
-      10,
-      {
-        position: tr.p,
-        quaternion: tr.q,
-        corners: cornersFor(wrong, 0, () => 0.5),
-        K,
-        markerSizeM: S,
-        reprojErrorPx: 0.1,
-      },
-      10,
-    )
-    expect(f.get(20).flat).toBe(false)
+    const sample = {
+      position: tr.p,
+      quaternion: tr.q,
+      corners: cornersFor(wrong, 0, () => 0.5),
+      K,
+      markerSizeM: S,
+      reprojErrorPx: 0.1,
+    }
+    f.onMarker(10, sample, 10)
+    // A single outlier is debounced; a persistent inconsistency flips to non-flat.
+    expect(f.get(20).flat).toBe(true)
+    f.onMarker(43, sample, 43)
+    f.onMarker(76, sample, 76)
+    expect(f.get(80).flat).toBe(false)
   })
 
   for (const cameraFrame of [false, true]) {

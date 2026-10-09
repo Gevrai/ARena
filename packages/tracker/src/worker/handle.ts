@@ -1,5 +1,5 @@
 import { detectFramedQr } from '../detect/framedQr'
-import type { DetectScratch } from '../detect/framedQr'
+import type { DetectScratch, Quad } from '../detect/framedQr'
 import { buildQrGrid } from '../marker/layout'
 import type { MarkerGrid } from '../marker/layout'
 import { estimatePose, poseToWorldFromCamera } from '../pose/pose'
@@ -10,13 +10,20 @@ export interface WorkerState {
   markerSizeM: number
   scratch: DetectScratch
   initError: string | null
+  /** Last detection, passed to the detector as an orientation / proximity hint (motion blur). */
+  hint: Quad | null
+  hintMisses: number
+  hintChain: number
   /** Detector override (tests); defaults to detectFramedQr. */
   detect?: typeof detectFramedQr
 }
 
 export function createWorkerState(): WorkerState {
-  return { grid: null, markerSizeM: 0.05, scratch: {}, initError: null }
+  return { grid: null, markerSizeM: 0.05, scratch: {}, initError: null, hint: null, hintMisses: 0, hintChain: 0 }
 }
+
+const HINT_MAX_MISSES = 8
+const HINT_MAX_CHAIN = 12
 
 const nowMs = (): number => globalThis.performance?.now() ?? Date.now()
 
@@ -68,7 +75,25 @@ export function handleMessage(msg: ToWorker, state: WorkerState): FromWorker | n
   }
   try {
     const img = { width: msg.width, height: msg.height, data: new Uint8Array(msg.gray) }
-    const det = (state.detect ?? detectFramedQr)(img, state.grid, {}, state.scratch)
+    const det = (state.detect ?? detectFramedQr)(
+      img,
+      state.grid,
+      state.hint ? { hint: state.hint } : {},
+      state.scratch,
+    )
+    if (det) {
+      state.hint = det.corners
+      state.hintMisses = 0
+      // A hint-only chain is capped so a wrong lock cannot persist: a full QR read is then needed.
+      state.hintChain = det.viaHint ? state.hintChain + 1 : 0
+      if (state.hintChain > HINT_MAX_CHAIN) {
+        state.hint = null
+        state.hintChain = 0
+      }
+    } else if (++state.hintMisses > HINT_MAX_MISSES) {
+      state.hint = null
+      state.hintChain = 0
+    }
     let pose: FromWorker['pose'] = null
     let reprojErrorPx = NaN
     if (det) {

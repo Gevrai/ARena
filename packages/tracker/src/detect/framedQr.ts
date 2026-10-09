@@ -16,6 +16,8 @@ export interface Detection {
   /** 0..1 finder confidence. */
   score: number
   areaPx: number
+  /** True when the orientation came from the previous detection (QR unreadable, e.g. motion blur). */
+  viaHint?: boolean
 }
 
 export interface DetectOptions {
@@ -25,6 +27,11 @@ export interface DetectOptions {
   thresholdOffset?: number
   /** Minimum contour perimeter in px (default 120). */
   minPerimeterPx?: number
+  /**
+   * Corners of a recent detection. A candidate quad close to it keeps that orientation and passes
+   * with relaxed frame checks even when the QR itself is too blurred to read.
+   */
+  hint?: Quad
 }
 
 /** Reusable buffers between frames. */
@@ -35,6 +42,10 @@ export interface DetectScratch {
 const MAX_CANDIDATES = 12
 const MIN_EDGE_PX = 10
 const MIN_SCORE = 0.75
+/** Mean corner displacement (in marker edge lengths) for a candidate to match the hint. */
+const HINT_MAX_MOVE = 0.4
+/** Minimum whole-QR correlation for a hint-only (blurred) detection. */
+const HINT_MIN_QR_NCC = 0.2
 const UNIT: [number, number][] = [
   [0, 0],
   [1, 0],
@@ -56,6 +67,30 @@ interface BandStats {
   bandFrac: number
   quietFrac: number
   thr: number
+}
+
+/** Cyclic shift of `quad` that best matches the hint corners, or null when none is close enough. */
+function matchHint(quad: [number, number][], hint: Quad): number | null {
+  let edge = 0
+  for (let i = 0; i < 4; i++) {
+    const a = hint[i] as [number, number]
+    const b = hint[(i + 1) % 4] as [number, number]
+    edge += Math.hypot(a[0] - b[0], a[1] - b[1]) / 4
+  }
+  const d: number[] = []
+  for (let rot = 0; rot < 4; rot++) {
+    let acc = 0
+    for (let i = 0; i < 4; i++) {
+      const q = quad[(i + rot) % 4] as [number, number]
+      const h = hint[i] as [number, number]
+      acc += Math.hypot(q[0] - h[0], q[1] - h[1]) / 4
+    }
+    d.push(acc)
+  }
+  let bi = 0
+  for (let i = 1; i < 4; i++) if ((d[i] as number) < (d[bi] as number)) bi = i
+  const second = Math.min(...d.filter((_, i) => i !== bi))
+  return (d[bi] as number) < HINT_MAX_MOVE * edge && second > 1.5 * (d[bi] as number) ? bi : null
 }
 
 /** Frame band and quiet-zone checks with a locally derived threshold (rotation invariant). */
@@ -327,23 +362,44 @@ export function detectFramedQr(
   for (const cand of cands.slice(0, MAX_CANDIDATES)) {
     const H0 = homographyFromQuad(UNIT, cand.quad)
     if (!H0) continue
+    const near = opts.hint ? matchHint(cand.quad, opts.hint) !== null : false
+    // Near the previous detection the frame/quiet checks are relaxed (blur smears the thin quiet zone).
+    const minBand = near ? 0.7 : 0.9
+    const minQuiet = near ? 0.45 : 0.8
     const st = checkBand(img, H0)
-    if (!st || st.bandFrac < 0.9 || st.quietFrac < 0.8) continue
+    if (!st || st.bandFrac < minBand || st.quietFrac < minQuiet) continue
     const refined = refineCorners(img, cand.quad)
-    if (refined === cand.quad || !insideImage(img, refined)) continue
+    if (!insideImage(img, refined)) continue
     // Re-derive the threshold on the refined quad, then find orientation.
     const H1 = homographyFromQuad(UNIT, refined)
     const st1 = H1 ? checkBand(img, H1) : null
     if (!st1) continue
-    const rot = bestRotation(img, refined, grid)
+    if (st1.bandFrac < minBand || st1.quietFrac < minQuiet) continue
+    let rot = bestRotation(img, refined, grid)
+    let viaHint = false
+    if (!rot && near && opts.hint) {
+      const hr = matchHint(refined, opts.hint)
+      if (hr !== null) {
+        // Even when too blurred to read, the interior must still look like a QR (some correlation
+        // with the expected modules), not a plain card.
+        const dst = [0, 1, 2, 3].map((i) => refined[(i + hr) % 4] as [number, number])
+        const Hh = homographyFromQuad(UNIT, dst)
+        if (Hh && qrCorrelation(img, Hh, grid) >= HINT_MIN_QR_NCC) {
+          rot = { rot: hr, score: 0, margin: 0 }
+          viaHint = true
+        }
+      }
+    }
     if (!rot) continue
-    const score = (rot.score + st1.bandFrac + st1.quietFrac) / 3
-    if (score < MIN_SCORE) continue
+    const score = viaHint
+      ? 0.8 * ((st1.bandFrac + st1.quietFrac) / 2)
+      : (rot.score + st1.bandFrac + st1.quietFrac) / 3
+    if (!viaHint && score < MIN_SCORE) continue
     const c = [0, 1, 2, 3].map((i) => refined[(i + rot.rot) % 4] as [number, number])
     const corners = c as Quad
     const areaPx = Math.abs(signedArea2(c)) / 2
     if (!best || score > best.score || (score === best.score && areaPx > best.areaPx)) {
-      best = { corners, score, areaPx }
+      best = viaHint ? { corners, score, areaPx, viaHint } : { corners, score, areaPx }
     }
   }
   return best

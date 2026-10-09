@@ -27,6 +27,10 @@ export interface SynthOptions {
   background?: number | ((x: number, y: number) => number)
   noise?: number // gaussian sigma in gray levels
   blurPx?: number // box blur radius in pixels
+  /** Linear motion blur: streak length in pixels (box kernel along the direction, centred). */
+  motionBlurPx?: number
+  /** Motion direction in degrees (0 = along +x, 90 = along +y). */
+  motionAngleDeg?: number
   supersample?: number
   clutter?: Array<{ corners: [number, number][]; value: number }>
 }
@@ -149,6 +153,38 @@ export function renderSynthetic(
         let s = 0
         for (let k = -r; k <= r; k++) s += tmp[Math.min(height - 1, Math.max(0, y + k)) * width + x] ?? 0
         out[y * width + x] = s / n
+      }
+    }
+    cur = out
+  }
+
+  // Linear motion blur: average of bilinear samples along the motion direction.
+  const mb = opts.motionBlurPx ?? 0
+  if (mb > 0.01) {
+    const ang = ((opts.motionAngleDeg ?? 0) * Math.PI) / 180
+    const ux = Math.cos(ang)
+    const uy = Math.sin(ang)
+    const taps = Math.max(2, Math.ceil(mb * 2) + 1)
+    const out = new Float32Array(width * height)
+    const at = (xx: number, yy: number): number => {
+      const x0 = Math.min(width - 1, Math.max(0, Math.floor(xx)))
+      const y0 = Math.min(height - 1, Math.max(0, Math.floor(yy)))
+      const x1 = Math.min(width - 1, x0 + 1)
+      const y1 = Math.min(height - 1, y0 + 1)
+      const fx = Math.min(1, Math.max(0, xx - x0))
+      const fy = Math.min(1, Math.max(0, yy - y0))
+      const a = (cur[y0 * width + x0] ?? 0) * (1 - fx) + (cur[y0 * width + x1] ?? 0) * fx
+      const b = (cur[y1 * width + x0] ?? 0) * (1 - fx) + (cur[y1 * width + x1] ?? 0) * fx
+      return a * (1 - fy) + b * fy
+    }
+    for (let y = 0; y < height; y++) {
+      for (let x = 0; x < width; x++) {
+        let acc2 = 0
+        for (let k = 0; k < taps; k++) {
+          const o = (k / (taps - 1) - 0.5) * mb
+          acc2 += at(x + o * ux, y + o * uy)
+        }
+        out[y * width + x] = acc2 / taps
       }
     }
     cur = out

@@ -23,7 +23,8 @@ export function sampleGray(img: GrayImage, x: number, y: number): number {
 }
 
 const SAMPLES_PER_EDGE = 16
-const SEARCH = 2.5 // px each side of the current edge estimate
+const SEARCH_TIGHT = 2.5 // px each side of the current edge estimate
+const SEARCH_LOOSE = 4 // used for blurred edges (second chance)
 const STEP = 0.25
 const GRAD_H = 0.5
 
@@ -63,7 +64,15 @@ function residual(l: Line, x: number, y: number): number {
 }
 
 /** Subpixel edge position along the outward normal: argmax of the (dark inside -> light outside) gradient. */
-function edgeOffset(img: GrayImage, x: number, y: number, nx: number, ny: number): number | null {
+function edgeOffset(
+  img: GrayImage,
+  x: number,
+  y: number,
+  nx: number,
+  ny: number,
+  SEARCH: number,
+  minGrad: number,
+): number | null {
   const n = Math.round((2 * SEARCH) / STEP) + 1
   const g = new Array<number>(n)
   let best = -1
@@ -79,7 +88,7 @@ function edgeOffset(img: GrayImage, x: number, y: number, nx: number, ny: number
       best = i
     }
   }
-  if (best < 0 || bestV < 12) return null
+  if (best < 0 || bestV < minGrad) return null
   // Centroid of the positive gradient lobe around the peak.
   let num = 0
   let den = 0
@@ -92,7 +101,13 @@ function edgeOffset(img: GrayImage, x: number, y: number, nx: number, ny: number
   return den > 0 ? num / den : null
 }
 
-function refineOnce(img: GrayImage, quad: [number, number][]): [number, number][] | null {
+function refineOnce(
+  img: GrayImage,
+  quad: [number, number][],
+  search: number,
+  minGrad: number,
+  tol: number,
+): [number, number][] | null {
   // Orientation sign so that the normal points outward.
   let area2 = 0
   for (let i = 0; i < 4; i++) {
@@ -117,14 +132,14 @@ function refineOnce(img: GrayImage, quad: [number, number][]): [number, number][
       const t = 0.12 + (0.76 * (k + 0.5)) / SAMPLES_PER_EDGE
       const x = a[0] + t * ex
       const y = a[1] + t * ey
-      const off = edgeOffset(img, x, y, nx, ny)
+      const off = edgeOffset(img, x, y, nx, ny, search, minGrad)
       if (off !== null) pts.push([x + off * nx, y + off * ny])
     }
     let line = fitLine(pts)
     // Robust pass: drop outliers and refit.
     for (let pass = 0; pass < 2 && line; pass++) {
       const l = line
-      const kept = pts.filter(([x, y]) => residual(l, x, y) < 0.6)
+      const kept = pts.filter(([x, y]) => residual(l, x, y) < tol)
       if (kept.length < 5) return null
       pts = kept
       line = fitLine(pts)
@@ -151,11 +166,16 @@ function refineOnce(img: GrayImage, quad: [number, number][]): [number, number][
  * Returns the input unchanged if a fit fails.
  */
 export function refineCorners(img: GrayImage, quad: [number, number][]): [number, number][] {
-  let cur = quad
-  for (let it = 0; it < 2; it++) {
-    const next = refineOnce(img, cur)
-    if (!next) return it === 0 ? quad : cur
-    cur = next
+  const attempt = (search: number, minGrad: number, tol: number): [number, number][] | null => {
+    let cur = quad
+    for (let it = 0; it < 2; it++) {
+      const next = refineOnce(img, cur, search, minGrad, tol)
+      if (!next) return it === 0 ? null : cur
+      cur = next
+    }
+    return cur
   }
-  return cur
+  // Sharp edges first; motion-blurred edges have a wide ramp, a weak per-pixel gradient and a
+  // noisier peak, so a second attempt searches wider with looser gradient / outlier limits.
+  return attempt(SEARCH_TIGHT, 12, 0.6) ?? attempt(SEARCH_LOOSE, 5, 1.5) ?? quad
 }

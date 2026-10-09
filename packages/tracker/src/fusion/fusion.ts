@@ -119,10 +119,14 @@ export class PoseFusion {
   }
 
   /** Integrated displacement (m, world) and latest world acceleration, for diagnostics. */
-  accelInfo(now: number): { disp: Vec3; world: Vec3 } | null {
+  accelInfo(now: number): { disp: Vec3; world: Vec3; vel: Vec3 } | null {
     if (!this.useAccel) return null
     const disp = this.accel.displacement(now, this.worldRot)
-    return { disp, world: this.accel.latestWorld(this.worldRot) }
+    return {
+      disp,
+      world: this.accel.latestWorld(this.worldRot),
+      vel: this.accel.velocity(this.worldRot),
+    }
   }
 
   onImu(t: number, q: Quat): void {
@@ -202,7 +206,6 @@ export class PoseFusion {
       : m.position
     this.position = this.posFilter.filter(pos, tSec)
     if (this.useAccel) {
-      this.accel.noteMarker(frameTime, pos)
       this.accel.setAnchor(frameTime, this.position, this.lastArrivalT ?? frameTime, this.worldRot)
     }
   }

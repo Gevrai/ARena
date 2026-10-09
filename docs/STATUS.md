@@ -22,3 +22,4 @@
 - 2026-10-07: gravity-locked tracking (marker assumed flat on table)
 
 - Tracker latency: position filter retuned, constant-velocity prediction (`predictMs`, default 100), `smoothing` knob, `keepFrames`/`getSyncedFrame()`, demo controls (Smoothing / Predict / Sync video) and capture->result latency readout. Awaiting phone A/B.
+- 2026-10-08: fixed rotation/translation regression from marker-only outliers (flat debounce+hysteresis, regression velocity, saturating prediction tail, position-filter deadband); blur-robust detection (refine fallback + previous-detection hint); demo diagnostics HUD (hit%, strip). Awaiting phone check.

@@ -118,3 +118,10 @@ body {
   background: #ff5a36;
   color: #fff;
 }
+
+#strip {
+  display: block;
+  width: 180px;
+  height: 16px;
+  margin: 2px 0 6px;
+}

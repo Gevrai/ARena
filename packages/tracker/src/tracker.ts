@@ -104,7 +104,13 @@ export interface TrackerPose {
    */
   cameraYaw: number
 }
+/** Per-frame outcome for diagnostics: 'hit' marker detected (flat), 'nonflat' detected but not gravity-flat, 'miss' no marker. */
+export type FrameOutcome = 'hit' | 'nonflat' | 'miss'
 export interface TrackerStats {
+  /** Share of analysed frames in the last 2 s with a marker pose (0..1; NaN when none). */
+  hitRate2s: number
+  /** Outcomes of the last ~3 s of analysed frames, oldest first (t = arrival, performance.now()). */
+  recent: { t: number; outcome: FrameOutcome }[]
   detectHz: number
   detectMs: number
   reprojErrorPx: number
@@ -299,6 +305,7 @@ export function createTracker(opts: TrackerOptions): Tracker {
   let lastReproj = NaN
   let lastCorners: Detection['corners'] | null = null
   let lastError: string | undefined
+  const frameLog: { t: number; outcome: FrameOutcome }[] = []
 
   const videoSize = (): { w: number; h: number } =>
     video.videoWidth > 0 && video.videoHeight > 0
@@ -363,7 +370,8 @@ export function createTracker(opts: TrackerOptions): Tracker {
         now,
       )
       const sp = fusion.frameSyncedPose()
-      if (img && sp) {
+      // sp is stale when fusion ignored this sample as an outlier: never pair it with this image.
+      if (img && sp && sp.timestamp === r.timestamp) {
         const f = fusedToPose({
           position: sp.position,
           quaternion: sp.quaternion,
@@ -374,6 +382,13 @@ export function createTracker(opts: TrackerOptions): Tracker {
         synced = { image: img, timestamp: r.timestamp, pose: f }
       }
     }
+    const outcome: FrameOutcome = !(r.pose && r.corners)
+      ? 'miss'
+      : fusion.get(now).flat
+        ? 'hit'
+        : 'nonflat'
+    frameLog.push({ t: now, outcome })
+    while (frameLog.length && now - (frameLog[0] as { t: number }).t > 3000) frameLog.shift()
     // Drop frames whose results will never arrive (older than this one).
     for (const k of pendingFrames.keys()) if (k < r.id) pendingFrames.delete(k)
     refreshStatus()
@@ -658,6 +673,7 @@ export function createTracker(opts: TrackerOptions): Tracker {
     lastCorners = null
     synced = null
     pendingFrames.clear()
+    frameLog.length = 0
     lastError = undefined
     nextId = 1
     const { w, h } = videoSize()
@@ -743,7 +759,11 @@ export function createTracker(opts: TrackerOptions): Tracker {
     },
     stats() {
       const { w, h } = videoSize()
+      const now = performance.now()
+      const last2 = frameLog.filter((f) => now - f.t <= 2000)
       const out: TrackerStats = {
+        hitRate2s: last2.length ? last2.filter((f) => f.outcome !== 'miss').length / last2.length : NaN,
+        recent: frameLog.filter((f) => now - f.t <= 3000),
         detectHz: pump.stats().detectHz,
         detectMs: lastDetectMs,
         reprojErrorPx: lastReproj,

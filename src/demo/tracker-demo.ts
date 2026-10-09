@@ -30,6 +30,7 @@ const overlay = byId<HTMLCanvasElement>('overlay')
 const hud = byId('hud')
 const badge = byId('badge')
 const statsEl = byId('stats')
+const strip = byId<HTMLCanvasElement>('strip')
 const startPanel = byId('start-panel')
 const startMsg = byId('start-msg')
 const startBtn = byId<HTMLButtonElement>('start')
@@ -290,6 +291,21 @@ function drawCorners(): void {
   })
 }
 
+const STRIP_COLORS = { hit: '#2ecc71', nonflat: '#f5a623', miss: '#e74c3c' } as const
+/** Scrolling strip: one tick per analysed frame of the last 3 s, coloured by outcome. */
+function drawStrip(recent: { t: number; outcome: 'hit' | 'nonflat' | 'miss' }[], now: number): void {
+  const c = strip.getContext('2d')
+  if (!c) return
+  c.clearRect(0, 0, strip.width, strip.height)
+  c.fillStyle = 'rgba(255,255,255,0.12)'
+  c.fillRect(0, 0, strip.width, strip.height)
+  for (const f of recent) {
+    const x = strip.width - ((now - f.t) / 3000) * strip.width
+    c.fillStyle = STRIP_COLORS[f.outcome]
+    c.fillRect(Math.floor(x) - 1, 0, 3, strip.height)
+  }
+}
+
 function frame(now: number): void {
   requestAnimationFrame(frame)
   let pose = tracker.getPose()
@@ -328,14 +344,14 @@ function frame(now: number): void {
   if (now - lastStatsText > 200) {
     lastStatsText = now
     const st = tracker.stats()
+    const hit = Number.isFinite(st.hitRate2s) ? `${Math.round(st.hitRate2s * 100)}%` : '-'
     const lines = [
-      `detect  ${st.detectHz.toFixed(1)} Hz`,
-      `detect  ${st.detectMs.toFixed(1)} ms`,
-      `latency ${st.latencyMs.toFixed(0)} ms (capture->result)`,
-      `reproj  ${Number.isFinite(st.reprojErrorPx) ? st.reprojErrorPx.toFixed(2) : '-'} px`,
-      `imu     ${st.imu ? 'on' : 'off'}`,
-      `video   ${st.videoW}x${st.videoH}`,
+      `${pose.source}${pose.flat ? '' : ' NOT-FLAT'}  hit ${hit} (2s)`,
+      `detect ${st.detectHz.toFixed(1)} Hz  worker ${st.detectMs.toFixed(0)} ms`,
+      `latency ${st.latencyMs.toFixed(0)} ms  reproj ${Number.isFinite(st.reprojErrorPx) ? st.reprojErrorPx.toFixed(2) : '-'} px`,
+      `imu ${st.imu ? 'on' : 'off'}  video ${st.videoW}x${st.videoH}  conf ${pose.confidence.toFixed(2)}`,
     ]
+    drawStrip(st.recent, performance.now())
     if (st.lastError) lines.push(`error   ${st.lastError}`)
     statsEl.textContent = lines.join('\n')
   }

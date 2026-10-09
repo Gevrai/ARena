@@ -15,7 +15,7 @@ import {
   WebGLRenderer,
 } from 'three'
 import { createTracker } from '@arena/tracker'
-import type { TrackerError } from '@arena/tracker'
+import type { CameraInfo, TrackerError } from '@arena/tracker'
 import './demo.css'
 
 const byId = <T extends HTMLElement>(id: string): T => {
@@ -40,6 +40,9 @@ const optHfov = byId<HTMLInputElement>('opt-hfov')
 const hfovVal = byId('hfov-val')
 const optCorners = byId<HTMLInputElement>('opt-corners')
 const optAccel = byId<HTMLInputElement>('opt-accel')
+const optExposure = byId<HTMLInputElement>('opt-exposure')
+const barsCanvas = byId<HTMLCanvasElement>('bars')
+barsCanvas.height = 6 * 22 + 6 + 10
 
 // ---- settings (localStorage, best effort) ----
 interface Settings {
@@ -48,6 +51,7 @@ interface Settings {
   fov: number
   corners: boolean
   accel: boolean
+  shortExposure: boolean
   hudCollapsed: boolean
 }
 const KEY = 'arena-tracker-demo'
@@ -57,6 +61,7 @@ const defaults: Settings = {
   fov: 65,
   corners: false,
   accel: false,
+  shortExposure: false,
   hudCollapsed: false,
 }
 function loadSettings(): Settings {
@@ -73,6 +78,7 @@ function loadSettings(): Settings {
         fov: Math.min(80, Math.max(50, Number(p.fov ?? p.hfov) || defaults.fov)),
         corners: typeof p.corners === 'boolean' ? p.corners : defaults.corners,
         accel: p.accel === true,
+        shortExposure: p.shortExposure === true,
         hudCollapsed: p.hudCollapsed === true,
       }
     }
@@ -97,6 +103,7 @@ const tracker = createTracker({
   detectWidth: settings.detectWidth,
   useImu: settings.gyro,
   useAccel: settings.accel,
+  shortExposure: settings.shortExposure,
 })
 
 // ---- three.js scene ----
@@ -150,6 +157,7 @@ optHfov.value = String(settings.fov)
 hfovVal.textContent = String(settings.fov)
 optCorners.checked = settings.corners
 optAccel.checked = settings.accel
+optExposure.checked = settings.shortExposure
 hud.classList.toggle('collapsed', settings.hudCollapsed)
 
 byId('hud-toggle').addEventListener('click', () => {
@@ -182,6 +190,82 @@ optAccel.addEventListener('change', () => {
   tracker.setOptions({ useAccel: settings.accel })
   saveSettings()
 })
+
+optExposure.addEventListener('change', () => {
+  settings.shortExposure = optExposure.checked
+  tracker.setOptions({ shortExposure: settings.shortExposure })
+  saveSettings()
+})
+
+// ---- accelerometer bar meters (+-3 m/s2, centred, 1 s peak hold) ----
+const BAR_RANGE = 3
+const PEAK_HOLD_MS = 1000
+interface BarSpec {
+  left: string
+  right: string
+  title: string
+}
+const WORLD_BARS: BarSpec[] = [
+  { left: 'left', right: 'right', title: 'X (card left/right)' },
+  { left: 'down', right: 'up', title: 'Y (vertical)' },
+  { left: 'toward card top', right: 'bottom', title: 'Z (card top/bottom)' },
+]
+const DEVICE_BARS: BarSpec[] = [
+  { left: '-', right: '+', title: 'raw screen x (right edge)' },
+  { left: '-', right: '+', title: 'raw screen y (top edge)' },
+  { left: '-', right: '+', title: 'raw screen z (out of screen)' },
+]
+const peaks: { t: number; v: number }[][] = [[], [], [], [], [], []]
+function pushPeak(i: number, v: number, now: number): { max: number; min: number } {
+  const q = peaks[i] as { t: number; v: number }[]
+  q.push({ t: now, v })
+  while (q.length > 0 && now - (q[0] as { t: number }).t > PEAK_HOLD_MS) q.shift()
+  let max = -Infinity
+  let min = Infinity
+  for (const p of q) {
+    if (p.v > max) max = p.v
+    if (p.v < min) min = p.v
+  }
+  return { max, min }
+}
+function drawBars(world: number[], device: number[], now: number): void {
+  const c = barsCanvas.getContext('2d')
+  if (!c) return
+  const W = barsCanvas.width
+  const rowH = 22
+  const bx = 4
+  const bw = W - 8
+  c.clearRect(0, 0, W, barsCanvas.height)
+  c.font = '9px monospace'
+  c.textBaseline = 'top'
+  const rows: { spec: BarSpec; v: number; i: number; head: string }[] = [
+    ...WORLD_BARS.map((spec, k) => ({ spec, v: world[k] ?? 0, i: k, head: 'world ' })),
+    ...DEVICE_BARS.map((spec, k) => ({ spec, v: device[k] ?? 0, i: 3 + k, head: 'device ' })),
+  ]
+  rows.forEach((r, k) => {
+    const y = k * rowH + (k >= 3 ? 6 : 0)
+    const pk = pushPeak(r.i, r.v, now)
+    c.fillStyle = 'rgba(255,255,255,0.7)'
+    c.fillText(`${r.head}${r.spec.title}  ${r.v >= 0 ? '+' : ''}${r.v.toFixed(2)}`, bx, y)
+    c.fillStyle = 'rgba(255,255,255,0.12)'
+    c.fillRect(bx, y + 11, bw, 8)
+    const px = (v: number): number =>
+      bx + bw / 2 + (Math.max(-BAR_RANGE, Math.min(BAR_RANGE, v)) / BAR_RANGE) * (bw / 2)
+    c.fillStyle = r.v >= 0 ? '#2ecc71' : '#f5a623'
+    c.fillRect(Math.min(px(r.v), px(0)), y + 11, Math.abs(px(r.v) - px(0)), 8)
+    c.fillStyle = '#fff'
+    c.fillRect(px(pk.max) - 1, y + 10, 2, 10)
+    c.fillRect(px(pk.min) - 1, y + 10, 2, 10)
+    c.fillStyle = 'rgba(255,255,255,0.9)'
+    c.fillRect(px(0) - 0.5, y + 9, 1, 12)
+    c.fillStyle = 'rgba(255,255,255,0.45)'
+    c.textAlign = 'left'
+    c.fillText(`< ${r.spec.left}`, bx, y + 20 - 0)
+    c.textAlign = 'right'
+    c.fillText(`${r.spec.right} >`, bx + bw, y + 20 - 0)
+    c.textAlign = 'left'
+  })
+}
 
 // ---- start / errors ----
 const ERROR_TEXT: Record<TrackerError, string> = {
@@ -274,6 +358,21 @@ function drawStrip(
   }
 }
 
+function cameraLine(c: CameraInfo): string {
+  const s = c.settings
+  const et = c.exposureTime
+  const range = et ? `${et.min}..${et.max}` : 'n/a'
+  const cur = [
+    s.exposureMode ?? '?',
+    s.exposureTime !== undefined ? `t=${s.exposureTime}` : '',
+    s.frameRate !== undefined ? `${s.frameRate.toFixed(0)}fps` : '',
+  ]
+    .filter(Boolean)
+    .join(' ')
+  const modes = c.exposureModes ? c.exposureModes.join('/') : 'n/a'
+  return `exposure: ${c.capabilities ? 'caps ok' : 'no getCapabilities'} modes ${modes} time ${range} (x100us) maxfps ${c.frameRateMax ?? '?'}\n  now ${cur}  short:${c.shortExposure}${c.note ? ` (${c.note})` : ''}`
+}
+
 function frame(now: number): void {
   requestAnimationFrame(frame)
   const pose = tracker.getPose()
@@ -292,6 +391,11 @@ function frame(now: number): void {
 
   badge.textContent = pose.source
   badge.className = pose.source
+  barsCanvas.hidden = !settings.accel
+  if (settings.accel) {
+    const a = tracker.stats()
+    if (a.accelWorld && a.accelDevice) drawBars([...a.accelWorld], [...a.accelDevice], now)
+  }
   if (now - lastStatsText > 200) {
     lastStatsText = now
     const st = tracker.stats()
@@ -301,11 +405,18 @@ function frame(now: number): void {
       `detect ${st.detectHz.toFixed(1)} Hz  worker ${st.detectMs.toFixed(0)} ms`,
       `latency ${st.latencyMs.toFixed(0)} ms  reproj ${Number.isFinite(st.reprojErrorPx) ? st.reprojErrorPx.toFixed(2) : '-'} px`,
       `imu ${st.imu ? 'on' : 'off'}  video ${st.videoW}x${st.videoH}  conf ${pose.confidence.toFixed(2)}`,
+      `cam ${st.camFps.toFixed(1)} fps (presented ${Number.isFinite(st.camPresentedFps) ? st.camPresentedFps.toFixed(1) : '-'})  grab ${st.grabMeanMs.toFixed(1)} ms (last ${st.grabMs.toFixed(1)})`,
+      `pump dropped ${st.pumpDropped1s}/s (total ${st.pumpDroppedTotal})`,
+      cameraLine(st.camera),
     ]
     if (st.accelHz !== undefined && st.accelWorld) {
-      const w = st.accelWorld.map((v) => v.toFixed(1).padStart(5))
+      const v = st.accelVelMmS ?? [0, 0, 0]
+      const d = st.accelDispVecMm ?? [0, 0, 0]
+      const f = (x: number): string => x.toFixed(0).padStart(4)
       lines.push(
-        `accel ${st.accelHz} Hz  disp ${(st.accelDispMm ?? 0).toFixed(0)} mm  world x${w[0]} y${w[1]} z${w[2]} m/s2`,
+        `accel ${st.accelHz} Hz (dt ${Number.isFinite(st.accelDtMs ?? NaN) ? (st.accelDtMs ?? 0).toFixed(0) : '-'} ms, interval ${Number.isFinite(st.accelIntervalField ?? NaN) ? st.accelIntervalField : '-'}) ${st.accelSource ?? ''}`,
+        `vel mm/s  x${f(v[0] as number)} y${f(v[1] as number)} z${f(v[2] as number)}`,
+        `disp mm   x${f(d[0] as number)} y${f(d[1] as number)} z${f(d[2] as number)}  |${(st.accelDispMm ?? 0).toFixed(0)}|`,
       )
     }
     drawStrip(st.recent, performance.now())

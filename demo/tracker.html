@@ -15,7 +15,19 @@
       <div id="hud-body">
         <div><span id="badge">none</span></div>
         <pre id="stats"></pre>
-        <canvas id="strip" width="180" height="16" title="last 3 s: green detected, amber not flat, red no marker"></canvas>
+        <canvas
+          id="bars"
+          width="220"
+          height="150"
+          hidden
+          title="accelerometer, +-3 m/s2, white tick = 1 s peak hold"
+        ></canvas>
+        <canvas
+          id="strip"
+          width="180"
+          height="16"
+          title="last 3 s: green detected, amber not flat, red no marker"
+        ></canvas>
         <label><input type="checkbox" id="opt-gyro" /> Gyro</label>
         <label
           >Detect res
@@ -31,6 +43,7 @@
         </label>
         <label><input type="checkbox" id="opt-corners" /> Show corners</label>
         <label><input type="checkbox" id="opt-accel" /> Accelerometer (experimental)</label>
+        <label><input type="checkbox" id="opt-exposure" /> Short exposure (experimental)</label>
         <a href="../marker/">marker page</a>
       </div>
     </div>

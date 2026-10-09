@@ -39,6 +39,7 @@ const optRes = byId<HTMLSelectElement>('opt-res')
 const optHfov = byId<HTMLInputElement>('opt-hfov')
 const hfovVal = byId('hfov-val')
 const optCorners = byId<HTMLInputElement>('opt-corners')
+const optAccel = byId<HTMLInputElement>('opt-accel')
 
 // ---- settings (localStorage, best effort) ----
 interface Settings {
@@ -46,6 +47,7 @@ interface Settings {
   detectWidth: number
   fov: number
   corners: boolean
+  accel: boolean
   hudCollapsed: boolean
 }
 const KEY = 'arena-tracker-demo'
@@ -54,6 +56,7 @@ const defaults: Settings = {
   detectWidth: 640,
   fov: 65,
   corners: false,
+  accel: false,
   hudCollapsed: false,
 }
 function loadSettings(): Settings {
@@ -69,6 +72,7 @@ function loadSettings(): Settings {
           : defaults.detectWidth,
         fov: Math.min(80, Math.max(50, Number(p.fov ?? p.hfov) || defaults.fov)),
         corners: typeof p.corners === 'boolean' ? p.corners : defaults.corners,
+        accel: p.accel === true,
         hudCollapsed: p.hudCollapsed === true,
       }
     }
@@ -92,6 +96,7 @@ const tracker = createTracker({
   fovDeg: settings.fov,
   detectWidth: settings.detectWidth,
   useImu: settings.gyro,
+  useAccel: settings.accel,
 })
 
 // ---- three.js scene ----
@@ -144,6 +149,7 @@ optRes.value = String(settings.detectWidth)
 optHfov.value = String(settings.fov)
 hfovVal.textContent = String(settings.fov)
 optCorners.checked = settings.corners
+optAccel.checked = settings.accel
 hud.classList.toggle('collapsed', settings.hudCollapsed)
 
 byId('hud-toggle').addEventListener('click', () => {
@@ -168,6 +174,12 @@ optHfov.addEventListener('input', () => {
 })
 optCorners.addEventListener('change', () => {
   settings.corners = optCorners.checked
+  saveSettings()
+})
+
+optAccel.addEventListener('change', () => {
+  settings.accel = optAccel.checked
+  tracker.setOptions({ useAccel: settings.accel })
   saveSettings()
 })
 
@@ -246,7 +258,10 @@ function drawCorners(): void {
 
 const STRIP_COLORS = { hit: '#2ecc71', nonflat: '#f5a623', miss: '#e74c3c' } as const
 /** Scrolling strip: one tick per analysed frame of the last 3 s, coloured by outcome. */
-function drawStrip(recent: { t: number; outcome: 'hit' | 'nonflat' | 'miss' }[], now: number): void {
+function drawStrip(
+  recent: { t: number; outcome: 'hit' | 'nonflat' | 'miss' }[],
+  now: number,
+): void {
   const c = strip.getContext('2d')
   if (!c) return
   c.clearRect(0, 0, strip.width, strip.height)
@@ -287,6 +302,12 @@ function frame(now: number): void {
       `latency ${st.latencyMs.toFixed(0)} ms  reproj ${Number.isFinite(st.reprojErrorPx) ? st.reprojErrorPx.toFixed(2) : '-'} px`,
       `imu ${st.imu ? 'on' : 'off'}  video ${st.videoW}x${st.videoH}  conf ${pose.confidence.toFixed(2)}`,
     ]
+    if (st.accelHz !== undefined && st.accelWorld) {
+      const w = st.accelWorld.map((v) => v.toFixed(1).padStart(5))
+      lines.push(
+        `accel ${st.accelHz} Hz  disp ${(st.accelDispMm ?? 0).toFixed(0)} mm  world x${w[0]} y${w[1]} z${w[2]} m/s2`,
+      )
+    }
     drawStrip(st.recent, performance.now())
     if (st.lastError) lines.push(`error   ${st.lastError}`)
     statsEl.textContent = lines.join('\n')

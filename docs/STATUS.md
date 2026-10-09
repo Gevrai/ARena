@@ -21,3 +21,4 @@
 - Client devices: Android (primary), iPhone 6s / iOS 15 (secondary)
 - 2026-10-07: gravity-locked tracking (marker assumed flat on table)
 - 2026-10-08: tracker behaviour reverted to 68145bb (phone-verified good rotation); only observational diagnostics stats (hit rate, outcome strip, latency) kept; new ideas to return as opt-in toggles.
+- 2026-10-08: opt-in `useAccel` (accelerometer dead-reckoning of translation between/after detections, default off, demo checkbox "Accelerometer (experimental)"); needs phone validation of axis signs via HUD vector.

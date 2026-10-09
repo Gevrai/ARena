@@ -50,6 +50,12 @@ export interface TrackerOptions {
    * (and while the marker is lost). Default false; when false behaviour is unchanged.
    */
   useAccel?: boolean
+  /**
+   * Experimental: ask the camera for a short manual exposure (less motion blur, darker image)
+   * and 60 fps where supported, via applyConstraints. Default false; when false the camera track
+   * is never touched. Unsupported devices ignore it (see `stats().camera`).
+   */
+  shortExposure?: boolean
 }
 /**
  * Camera pose in the marker (world) frame.
@@ -94,6 +100,22 @@ export interface TrackerPose {
 }
 /** Per-frame outcome for diagnostics: 'hit' marker detected (flat), 'nonflat' detected but not gravity-flat, 'miss' no marker. */
 export type FrameOutcome = 'hit' | 'nonflat' | 'miss'
+/** Observational camera track info (never feeds back into tracking). */
+export interface CameraInfo {
+  /** getCapabilities() exists on this browser/track. */
+  capabilities: boolean
+  /** Supported exposureMode values, if reported. */
+  exposureModes?: string[]
+  /** exposureTime range as reported (Chrome: units of 100 microseconds). */
+  exposureTime?: { min: number; max: number; step?: number }
+  frameRateMax?: number
+  /** Current getSettings() values. */
+  settings: { exposureMode?: string; exposureTime?: number; frameRate?: number; iso?: number }
+  /** shortExposure state: 'off' | 'applied' | 'unsupported' | 'error'. */
+  shortExposure: 'off' | 'applied' | 'unsupported' | 'error'
+  /** What shortExposure asked for / any error text. */
+  note?: string
+}
 export interface TrackerStats {
   /** Share of analysed frames in the last 2 s with a marker pose (0..1; NaN when none). Observational only. */
   hitRate2s: number
@@ -116,6 +138,28 @@ export interface TrackerStats {
   accelDispMm?: number
   /** Only when useAccel is on: latest gravity-free acceleration in the world frame (m/s^2). */
   accelWorld?: Vec3
+  /** Only when useAccel is on: latest raw device-frame acceleration (x right edge, y top edge, z out of screen), m/s^2. */
+  accelDevice?: Vec3
+  /** Only when useAccel is on: 'linear' (event.acceleration) or 'gravity-fallback'. */
+  accelSource?: 'linear' | 'gravity-fallback'
+  /** Only when useAccel is on: median devicemotion event spacing over the last second (ms) and the browser's `interval` field. */
+  accelDtMs?: number
+  accelIntervalField?: number
+  /** Only when useAccel is on: velocity estimate (world, mm/s) and displacement since the last detection (world, mm). */
+  accelVelMmS?: Vec3
+  accelDispVecMm?: Vec3
+  /** requestVideoFrameCallback callbacks per second (camera frames reaching the page). */
+  camFps: number
+  /** Frames the browser presented per second (rVFC `presentedFrames` delta); camFps lower than this means rVFC missed frames. NaN if unavailable. */
+  camPresentedFps: number
+  /** Main-thread grab time per frame (drawImage + getImageData + gray), ms, last value and mean of the last second. */
+  grabMs: number
+  grabMeanMs: number
+  /** Frames skipped by the pump (worker busy or no free buffer) in the last second, and in total. */
+  pumpDropped1s: number
+  pumpDroppedTotal: number
+  /** Camera track capabilities and settings. */
+  camera: CameraInfo
 }
 /**
  * AR marker tracker. World frame: origin at the marker centre, +Y up, +X to the card's right,
@@ -150,7 +194,13 @@ export interface Tracker {
     o: Partial<
       Pick<
         TrackerOptions,
-        'fovDeg' | 'hfovDeg' | 'detectWidth' | 'useImu' | 'captureLatencyMs' | 'useAccel'
+        | 'fovDeg'
+        | 'hfovDeg'
+        | 'detectWidth'
+        | 'useImu'
+        | 'captureLatencyMs'
+        | 'useAccel'
+        | 'shortExposure'
       >
     >,
   ): void
@@ -187,7 +237,7 @@ function screenAngle(): number {
  * on the performance.now() clock (HTML spec; Chrome: captureTime only for local camera/WebRTC
  * frames; Safari/Firefox do not provide it, so those use the fallbacks). Not verified on device.
  */
-type FrameMeta = { captureTime?: number; expectedDisplayTime?: number }
+type FrameMeta = { captureTime?: number; expectedDisplayTime?: number; presentedFrames?: number }
 type VideoWithRvfc = HTMLVideoElement & {
   requestVideoFrameCallback?: (cb: (now: number, md: FrameMeta) => void) => number
   cancelVideoFrameCallback?: (h: number) => void
@@ -219,6 +269,7 @@ export function createTracker(opts: TrackerOptions): Tracker {
   let detectWidth = opts.detectWidth ?? 640
   let useImu = opts.useImu ?? true
   let useAccel = opts.useAccel ?? false
+  let shortExposure = opts.shortExposure ?? false
 
   let status: TrackerStatus = { state: 'idle' }
   const listeners = new Set<(s: TrackerStatus) => void>()
@@ -236,6 +287,18 @@ export function createTracker(opts: TrackerOptions): Tracker {
   let accelActive = false
   let latestImuQ: Quat | null = null
   const accelTimes: number[] = []
+  let accelDevice: Vec3 = [0, 0, 0]
+  let accelSource: 'linear' | 'gravity-fallback' = 'linear'
+  let accelIntervalField = NaN
+  // Observational frame-rate / grab instrumentation.
+  const tickLog: { t: number; presented: number }[] = []
+  const grabLog: { t: number; ms: number }[] = []
+  const dropLog: number[] = []
+  let dropTotal = 0
+  let lastGrabMs = 0
+  let exposureState: CameraInfo['shortExposure'] = 'off'
+  let exposureNote: string | undefined
+  let exposureApplied = false
   let motionGranted = false
   let running = false
   let gen = 0
@@ -286,13 +349,20 @@ export function createTracker(opts: TrackerOptions): Tracker {
     const lin = ev.acceleration
     let a: Vec3 | null = null
     if (lin && lin.x != null && lin.y != null && lin.z != null) {
+      accelDevice = [lin.x, lin.y, lin.z]
+      accelSource = 'linear'
       a = deviceAccelToCamera([lin.x, lin.y, lin.z], screenAngle())
     } else {
       const g = ev.accelerationIncludingGravity
-      if (g && g.x != null && g.y != null && g.z != null && latestImuQ)
+      if (g && g.x != null && g.y != null && g.z != null && latestImuQ) {
+        accelSource = 'gravity-fallback'
         a = gravityFreeToCamera([g.x, g.y, g.z], latestImuQ, screenAngle())
+        // Device-frame, gravity-free: rotate the camera-frame result back for display.
+        accelDevice = deviceAccelToCamera(a, -screenAngle())
+      }
     }
     if (!a) return
+    accelIntervalField = typeof ev.interval === 'number' ? ev.interval : NaN
     accelTimes.push(ts)
     while (accelTimes.length > 0 && ts - (accelTimes[0] as number) > 1000) accelTimes.shift()
     fusion.onAccel(ts, a)
@@ -369,8 +439,11 @@ export function createTracker(opts: TrackerOptions): Tracker {
     if (!worker) return
     if (!pump.canSend() || pool.length === 0) {
       pump.noteDropped()
+      dropTotal++
+      dropLog.push(performance.now())
       return
     }
+    const grabT0 = performance.now()
     const { w: vw, h: vh } = videoSize()
     const dw = Math.max(16, Math.round(detectWidth))
     const dh = Math.max(16, Math.round((dw * vh) / vw))
@@ -390,6 +463,9 @@ export function createTracker(opts: TrackerOptions): Tracker {
       toGray(data, dw, dh, pb.img)
       sentId = nextId++
       postFrame(pb, sentId, dw, dh, frameTime)
+      const grabT1 = performance.now()
+      lastGrabMs = grabT1 - grabT0
+      grabLog.push({ t: grabT1, ms: lastGrabMs })
     } catch (e) {
       lastError = e instanceof Error ? e.message : String(e)
       if (sentId !== null) pump.markDone(sentId)
@@ -432,6 +508,118 @@ export function createTracker(opts: TrackerOptions): Tracker {
     return performance.now() - (captureLatencyMs ?? 40)
   }
 
+  // ---- camera track capabilities / short exposure (opt-in) ----
+  type Range = { min?: number; max?: number; step?: number }
+  type TrackCaps = {
+    exposureMode?: string[]
+    exposureTime?: Range
+    frameRate?: Range
+  }
+  type TrackSettings = {
+    exposureMode?: string
+    exposureTime?: number
+    frameRate?: number
+    iso?: number
+  }
+  type TrackLike = {
+    getCapabilities?: () => TrackCaps
+    getSettings?: () => TrackSettings
+    applyConstraints(c: object): Promise<void>
+  }
+  const videoTrack = (): TrackLike | null => {
+    const tracks = stream?.getTracks() ?? []
+    return (tracks.find((t) => t.kind === 'video') ??
+      tracks[0] ??
+      null) as unknown as TrackLike | null
+  }
+
+  /** Short manual exposure target (Chrome exposureTime units: 100 us) ~ 6 ms. */
+  const SHORT_EXPOSURE_UNITS = 60
+
+  const applyExposure = async (on: boolean): Promise<void> => {
+    const tr = videoTrack()
+    if (!tr) return
+    if (!on) {
+      if (!exposureApplied) {
+        exposureState = 'off'
+        exposureNote = undefined
+        return
+      }
+      exposureApplied = false
+      exposureState = 'off'
+      exposureNote = undefined
+      try {
+        await tr.applyConstraints({ advanced: [{ exposureMode: 'continuous' } as object] })
+      } catch {
+        // best effort
+      }
+      return
+    }
+    const caps = tr.getCapabilities?.()
+    const modes = caps?.exposureMode
+    const et = caps?.exposureTime
+    if (
+      !caps ||
+      !modes?.includes('manual') ||
+      !et ||
+      et.min === undefined ||
+      et.max === undefined
+    ) {
+      exposureState = 'unsupported'
+      exposureNote = caps ? 'no manual exposure / exposureTime' : 'getCapabilities unavailable'
+      return
+    }
+    let target = Math.min(et.max, Math.max(et.min, SHORT_EXPOSURE_UNITS))
+    if (et.step && et.step > 0) target = et.min + Math.round((target - et.min) / et.step) * et.step
+    const adv: Record<string, unknown> = { exposureMode: 'manual', exposureTime: target }
+    const notes = [`exposureTime ${target}`]
+    try {
+      await tr.applyConstraints({ advanced: [adv] })
+      exposureApplied = true
+      exposureState = 'applied'
+      const fmax = caps.frameRate?.max
+      if (typeof fmax === 'number' && fmax >= 60) {
+        try {
+          await tr.applyConstraints({ frameRate: { ideal: 60 } })
+          notes.push('60 fps')
+        } catch {
+          notes.push('60 fps refused')
+        }
+      } else notes.push(`fps max ${fmax ?? '?'}`)
+      exposureNote = notes.join(', ')
+    } catch (e) {
+      exposureState = 'error'
+      exposureNote = e instanceof Error ? e.message : String(e)
+    }
+  }
+  const applyExposureQuiet = (on: boolean): void => {
+    applyExposure(on).catch(() => undefined)
+  }
+
+  const cameraInfo = (): CameraInfo => {
+    const tr = videoTrack()
+    const caps = tr?.getCapabilities?.()
+    const st = tr?.getSettings?.() ?? {}
+    const info: CameraInfo = {
+      capabilities: !!caps,
+      settings: {},
+      shortExposure: exposureState,
+    }
+    if (caps?.exposureMode) info.exposureModes = caps.exposureMode
+    const et = caps?.exposureTime
+    if (et && et.min !== undefined && et.max !== undefined) {
+      info.exposureTime = { min: et.min, max: et.max }
+      if (et.step !== undefined) info.exposureTime.step = et.step
+    }
+    if (caps?.frameRate?.max !== undefined) info.frameRateMax = caps.frameRate.max
+    if (st.exposureMode !== undefined) info.settings.exposureMode = st.exposureMode
+    if (st.exposureTime !== undefined) info.settings.exposureTime = st.exposureTime
+    if (st.frameRate !== undefined) info.settings.frameRate = st.frameRate
+    if (st.iso !== undefined) info.settings.iso = st.iso
+    if (exposureNote !== undefined) info.note = exposureNote
+    return info
+  }
+
   const cancelLoop = (): void => {
     if (loopHandle !== null) {
       if (loopIsRvfc) video.cancelVideoFrameCallback?.(loopHandle)
@@ -445,6 +633,9 @@ export function createTracker(opts: TrackerOptions): Tracker {
     const tick = (_now?: number, md?: FrameMeta): void => {
       if (!running || loopPaused) return
       try {
+        const nowT = performance.now()
+        tickLog.push({ t: nowT, presented: md?.presentedFrames ?? NaN })
+        while (tickLog.length > 0 && nowT - (tickLog[0] as { t: number }).t > 1100) tickLog.shift()
         grab(frameTimeOf(md))
         refreshStatus()
       } finally {
@@ -519,6 +710,8 @@ export function createTracker(opts: TrackerOptions): Tracker {
         stream = st
         watchTracks(st, true)
         trackEnded = false
+        exposureApplied = false
+        if (shortExposure) applyExposureQuiet(true)
         video.srcObject = st
         await video.play()
         if (my !== gen) return
@@ -627,6 +820,10 @@ export function createTracker(opts: TrackerOptions): Tracker {
     motionGranted = motion === 'granted'
     stream = got.st
 
+    exposureApplied = false
+    exposureState = 'off'
+    exposureNote = undefined
+    if (shortExposure) applyExposureQuiet(true)
     video.srcObject = stream
     video.setAttribute('playsinline', '')
     video.muted = true
@@ -647,6 +844,10 @@ export function createTracker(opts: TrackerOptions): Tracker {
     lastCorners = null
     lastError = undefined
     nextId = 1
+    tickLog.length = 0
+    grabLog.length = 0
+    dropLog.length = 0
+    dropTotal = 0
     const { w, h } = videoSize()
     const dw = Math.round(detectWidth)
     const dh = Math.round((dw * h) / w)
@@ -750,6 +951,39 @@ export function createTracker(opts: TrackerOptions): Tracker {
     },
     stats() {
       const { w, h } = videoSize()
+      const frameDiag = (
+        now: number,
+      ): Pick<
+        TrackerStats,
+        | 'camFps'
+        | 'camPresentedFps'
+        | 'grabMs'
+        | 'grabMeanMs'
+        | 'pumpDropped1s'
+        | 'pumpDroppedTotal'
+        | 'camera'
+      > => {
+        const ticks = tickLog.filter((x) => now - x.t <= 1000)
+        let presentedFps = NaN
+        const first = ticks[0]
+        const lastTick = ticks[ticks.length - 1]
+        if (first && lastTick && lastTick.t > first.t && Number.isFinite(first.presented))
+          presentedFps = ((lastTick.presented - first.presented) * 1000) / (lastTick.t - first.t)
+        while (grabLog.length > 0 && now - (grabLog[0] as { t: number }).t > 1000) grabLog.shift()
+        while (dropLog.length > 0 && now - (dropLog[0] as number) > 1000) dropLog.shift()
+        return {
+          camFps:
+            ticks.length > 1 && first && lastTick
+              ? ((ticks.length - 1) * 1000) / Math.max(1, lastTick.t - first.t)
+              : 0,
+          camPresentedFps: presentedFps,
+          grabMs: lastGrabMs,
+          grabMeanMs: grabLog.length ? grabLog.reduce((s, g) => s + g.ms, 0) / grabLog.length : 0,
+          pumpDropped1s: dropLog.length,
+          pumpDroppedTotal: dropTotal,
+          camera: cameraInfo(),
+        }
+      }
       const now = performance.now()
       const last2 = frameLog.filter((f) => now - f.t <= 2000)
       const out: TrackerStats = {
@@ -765,6 +999,7 @@ export function createTracker(opts: TrackerOptions): Tracker {
         corners: lastCorners,
         videoW: video.videoWidth > 0 ? w : 0,
         videoH: video.videoHeight > 0 ? h : 0,
+        ...frameDiag(now),
       }
       if (lastError !== undefined) out.lastError = lastError
       if (useAccel) {
@@ -773,6 +1008,19 @@ export function createTracker(opts: TrackerOptions): Tracker {
         out.accelHz = win.length
         out.accelDispMm = info ? Math.hypot(info.disp[0], info.disp[1], info.disp[2]) * 1000 : 0
         out.accelWorld = info ? info.world : [0, 0, 0]
+        out.accelDevice = accelDevice
+        out.accelSource = accelSource
+        out.accelIntervalField = accelIntervalField
+        const gaps: number[] = []
+        for (let i = 1; i < win.length; i++) gaps.push((win[i] as number) - (win[i - 1] as number))
+        gaps.sort((p, q) => p - q)
+        out.accelDtMs = gaps.length ? (gaps[Math.floor(gaps.length / 2)] as number) : NaN
+        out.accelVelMmS = info
+          ? [info.vel[0] * 1000, info.vel[1] * 1000, info.vel[2] * 1000]
+          : [0, 0, 0]
+        out.accelDispVecMm = info
+          ? [info.disp[0] * 1000, info.disp[1] * 1000, info.disp[2] * 1000]
+          : [0, 0, 0]
       }
       return out
     },
@@ -781,6 +1029,10 @@ export function createTracker(opts: TrackerOptions): Tracker {
       if (o.fovDeg !== undefined) fovDeg = o.fovDeg
       if (o.captureLatencyMs !== undefined) captureLatencyMs = o.captureLatencyMs
       if (o.detectWidth !== undefined) detectWidth = o.detectWidth
+      if (o.shortExposure !== undefined && o.shortExposure !== shortExposure) {
+        shortExposure = o.shortExposure
+        if (running) applyExposureQuiet(shortExposure)
+      }
       if (o.useAccel !== undefined && o.useAccel !== useAccel) {
         useAccel = o.useAccel
         accelTimes.length = 0

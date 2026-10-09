@@ -18,6 +18,7 @@ export type {
   TrackerStatus,
   TrackerError,
   TrackerStats,
+  CameraInfo,
   FrameOutcome,
 } from './tracker'
 export { intrinsicsFromSize, projectionForCover } from './pose/intrinsics'

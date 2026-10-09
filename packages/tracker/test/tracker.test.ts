@@ -750,3 +750,67 @@ describe('cameraYawFromQuat', () => {
     expect(cameraYawFromQuat(turned)).toBeCloseTo(0.5, 6)
   })
 })
+
+describe('shortExposure (opt-in)', () => {
+  const withTrack = (extra: object) => {
+    const track = {
+      stop: vi.fn(),
+      readyState: 'live',
+      applyConstraints: vi.fn(async () => {}),
+      ...makeTarget(),
+      ...extra,
+    }
+    vi.stubGlobal('navigator', {
+      mediaDevices: { getUserMedia: vi.fn(async () => ({ getTracks: () => [track] })) },
+    })
+    return track
+  }
+  const flush = () => new Promise((r) => setTimeout(r, 0))
+
+  it('off by default: never touches the camera track; stats expose frame diagnostics', async () => {
+    const track = withTrack({})
+    const { tracker, video } = mk({ useImu: false })
+    await tracker.start()
+    video.cb!()
+    await flush()
+    expect(track.applyConstraints).not.toHaveBeenCalled()
+    const st = tracker.stats()
+    expect(st.camera.shortExposure).toBe('off')
+    expect(st.camFps).toBeGreaterThanOrEqual(0)
+    expect(st.grabMs).toBeGreaterThanOrEqual(0)
+    tracker.stop()
+  })
+
+  it('on + unsupported track: reports unsupported without throwing', async () => {
+    const track = withTrack({})
+    const { tracker } = mk({ useImu: false, shortExposure: true })
+    await tracker.start()
+    await flush()
+    expect(track.applyConstraints).not.toHaveBeenCalled()
+    expect(tracker.stats().camera.shortExposure).toBe('unsupported')
+    tracker.stop()
+  })
+
+  it('on + supported track: manual exposure near the low end, 60 fps when available', async () => {
+    const track = withTrack({
+      getCapabilities: () => ({
+        exposureMode: ['continuous', 'manual'],
+        exposureTime: { min: 3, max: 2000, step: 1 },
+        frameRate: { min: 1, max: 60 },
+      }),
+      getSettings: () => ({ exposureMode: 'manual', exposureTime: 60, frameRate: 60 }),
+    })
+    const { tracker } = mk({ useImu: false, shortExposure: true })
+    await tracker.start()
+    await flush()
+    expect(track.applyConstraints).toHaveBeenCalledWith({
+      advanced: [{ exposureMode: 'manual', exposureTime: 60 }],
+    })
+    expect(track.applyConstraints).toHaveBeenCalledWith({ frameRate: { ideal: 60 } })
+    const cam = tracker.stats().camera
+    expect(cam.shortExposure).toBe('applied')
+    expect(cam.exposureTime).toEqual({ min: 3, max: 2000, step: 1 })
+    expect(cam.settings.frameRate).toBe(60)
+    tracker.stop()
+  })
+})
